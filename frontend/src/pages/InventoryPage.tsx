@@ -1,20 +1,30 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
+import { FeedbackMessage } from '../components/FeedbackMessage'
+import { FamilyVariantsPanel } from '../components/FamilyVariantsPanel'
+import { SuggestionInput } from '../components/SuggestionInput'
+import { useEmployeeSession } from '../lib/auth'
 import { formatMoney } from '../lib/currency'
+import { buildExpiryAlertSummary, type ExpiryAlertSummary } from '../lib/expiry-alerts'
 import { exportRowsToCsv } from '../lib/export'
+import { fetchPurchaseReceipts } from '../lib/purchases-api'
+import { getUserFacingErrorMessage } from '../lib/user-facing-errors'
 import {
   createProduct,
   deleteProduct,
+  fetchInventoryBatches,
   fetchProducts,
   fetchStockMovements,
   submitStockAdjustment,
   updateProduct,
+  type InventoryBatch,
   type StockMovement,
 } from '../lib/products-api'
-import { roundMoney, type Product } from '../lib/pos'
+import { buildProductDisplayName, roundMoney, type Product } from '../lib/pos'
 
 type ProductFormState = {
   name: string
+  variantLabel: string
   barcode: string
   wholesaleBarcode: string
   plu: string
@@ -41,6 +51,7 @@ const weightWholesaleUnits = ['كيس', 'شوال', 'تنكة']
 
 const emptyProductForm: ProductFormState = {
   name: '',
+  variantLabel: '',
   barcode: '',
   wholesaleBarcode: '',
   plu: '',
@@ -107,9 +118,38 @@ function getMovementTypeLabel(movementType: StockMovement['movementType']) {
         : 'تعديل'
 }
 
+function getExpiryCardClasses(severity: 'expired' | 'critical' | 'warning') {
+  return severity === 'expired'
+    ? 'border-rose-200 bg-rose-50/90 text-rose-900'
+    : severity === 'critical'
+      ? 'border-amber-200 bg-amber-50/90 text-amber-900'
+      : 'border-sky-200 bg-sky-50/90 text-sky-900'
+}
+
+function getExpiryBadgeClasses(severity: 'expired' | 'critical' | 'warning') {
+  return severity === 'expired'
+    ? 'bg-rose-100 text-rose-800'
+    : severity === 'critical'
+      ? 'bg-amber-100 text-amber-800'
+      : 'bg-sky-100 text-sky-800'
+}
+
+function getExpiryLabel(daysUntilExpiry: number) {
+  if (daysUntilExpiry < 0) {
+    return `منتهي منذ ${Math.abs(daysUntilExpiry)} يوم`
+  }
+
+  if (daysUntilExpiry === 0) {
+    return 'ينتهي اليوم'
+  }
+
+  return `متبقّي ${daysUntilExpiry} يوم`
+}
+
 function createProductForm(product: Product): ProductFormState {
   return {
-    name: product.name,
+    name: product.productFamilyName,
+    variantLabel: product.variantLabel ?? '',
     barcode: product.barcode,
     wholesaleBarcode: product.wholesaleBarcode ?? '',
     plu: product.plu ?? '',
@@ -130,14 +170,49 @@ function createProductForm(product: Product): ProductFormState {
   }
 }
 
+type ProductFamilyGroup = {
+  familyName: string
+  departments: string[]
+  products: Product[]
+  variantCount: number
+  lowStockCount: number
+  totalStockQty: number
+  totalInventoryValue: number
+  hasExpiryAlert: boolean
+}
+
+type ProductFamilyProfile = {
+  familyName: string
+  variantSuggestions: string[]
+  department: string
+  measurementType: ProductFormState['measurementType']
+  purchaseCostBasis: ProductFormState['purchaseCostBasis']
+  retailUnit: string
+  wholesaleEnabled: boolean
+  wholesaleUnit: string
+  wholesaleQuantity: string
+  vatRate: string
+  skuCount: number
+  totalStockQty: number
+}
+
 export function InventoryPage() {
+  const { session } = useEmployeeSession()
   const [products, setProducts] = useState<Product[]>([])
   const [movements, setMovements] = useState<StockMovement[]>([])
+  const [inventoryBatches, setInventoryBatches] = useState<InventoryBatch[]>([])
+  const [expirySummary, setExpirySummary] = useState<ExpiryAlertSummary>({
+    alerts: [],
+    expiredCount: 0,
+    criticalCount: 0,
+    warningCount: 0,
+    affectedProductsCount: 0,
+  })
   const [selectedProductId, setSelectedProductId] = useState('')
   const [quantityDelta, setQuantityDelta] = useState('')
   const [note, setNote] = useState('')
   const [productQuery, setProductQuery] = useState('')
-  const [stockFilter, setStockFilter] = useState<'all' | 'low' | 'weighted'>('all')
+  const [stockFilter, setStockFilter] = useState<'all' | 'low' | 'weighted' | 'expiry' | 'unpriced'>('all')
   const [movementQuery, setMovementQuery] = useState('')
   const [movementFilter, setMovementFilter] = useState<'all' | 'sale' | 'adjustment' | 'return' | 'purchase'>('all')
   const [productForm, setProductForm] = useState<ProductFormState>(emptyProductForm)
@@ -166,17 +241,21 @@ export function InventoryPage() {
     setIsLoading(true)
 
     try {
-      const [nextProducts, nextMovements] = await Promise.all([
+      const [nextProducts, nextMovements, nextReceipts, nextBatches] = await Promise.all([
         fetchProducts(),
         fetchStockMovements(),
+        fetchPurchaseReceipts(),
+        fetchInventoryBatches(),
       ])
       setProducts(nextProducts)
       setMovements(nextMovements)
+      setInventoryBatches(nextBatches.filter((batch) => batch.remainingQuantity > 0))
+      setExpirySummary(buildExpiryAlertSummary(nextReceipts, nextProducts))
       setSelectedProductId((currentValue) => currentValue || nextProducts[0]?.id || '')
       syncProductForm(nextProducts, editingProductId)
       setMessage(null)
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'تعذر تحميل بيانات المخزون.')
+      setMessage(getUserFacingErrorMessage(error, 'تعذر تحميل بيانات المخزون.'))
     } finally {
       setIsLoading(false)
     }
@@ -189,6 +268,42 @@ export function InventoryPage() {
   function resetProductForm() {
     setEditingProductId(null)
     setProductForm(emptyProductForm)
+  }
+
+  function buildProductFormForFamily(name: string): ProductFormState {
+    const matchedProfile = getFamilyProfileByName(name)
+
+    if (!matchedProfile) {
+      return {
+        ...emptyProductForm,
+        name,
+      }
+    }
+
+    return {
+      ...emptyProductForm,
+      name,
+      department: matchedProfile.department,
+      measurementType: matchedProfile.measurementType,
+      purchaseCostBasis: matchedProfile.wholesaleEnabled ? matchedProfile.purchaseCostBasis : 'retail',
+      retailUnit: matchedProfile.retailUnit,
+      wholesaleEnabled: matchedProfile.wholesaleEnabled,
+      wholesaleUnit: matchedProfile.wholesaleUnit,
+      wholesaleQuantity: matchedProfile.wholesaleQuantity,
+      vatRate: matchedProfile.vatRate,
+    }
+  }
+
+  function startNewVariantForFamily(name: string) {
+    const normalizedFamilyName = name.trim()
+
+    if (!normalizedFamilyName) {
+      return
+    }
+
+    setEditingProductId(null)
+    setProductForm(buildProductFormForFamily(normalizedFamilyName))
+    setMessage(`تم تجهيز النموذج لإضافة صنف فرعي جديد تحت عائلة ${normalizedFamilyName}.`)
   }
 
   function startEditingProduct(product: Product) {
@@ -210,7 +325,7 @@ export function InventoryPage() {
     const minStock = Number(productForm.minStock)
 
     if (productForm.name.trim().length < 3 || productForm.department.trim().length < 2) {
-      setMessage('أكمل اسم الصنف والقسم بشكل صحيح.')
+      setMessage('أكمل اسم المنتج الرئيسي والقسم بشكل صحيح.')
       return
     }
 
@@ -255,8 +370,12 @@ export function InventoryPage() {
     setIsSubmitting(true)
 
     try {
+      const productFamilyName = productForm.name.trim()
+      const variantLabel = productForm.variantLabel.trim() || undefined
       const payload = {
-        name: productForm.name.trim(),
+        name: buildProductDisplayName(productFamilyName, variantLabel),
+        productFamilyName,
+        variantLabel,
         barcode: productForm.barcode.trim(),
         wholesaleBarcode: wholesaleEnabled ? productForm.wholesaleBarcode.trim() || undefined : undefined,
         plu: productForm.plu.trim() || undefined,
@@ -286,7 +405,7 @@ export function InventoryPage() {
       resetProductForm()
       await loadInventoryData()
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'تعذر حفظ بيانات الصنف.')
+      setMessage(getUserFacingErrorMessage(error, 'تعذر حفظ بيانات الصنف.'))
     } finally {
       setIsSubmitting(false)
     }
@@ -303,7 +422,7 @@ export function InventoryPage() {
       await loadInventoryData()
       setMessage('تم حذف الصنف بنجاح.')
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'تعذر حذف الصنف.')
+      setMessage(getUserFacingErrorMessage(error, 'تعذر حذف الصنف.'))
     } finally {
       setIsSubmitting(false)
     }
@@ -342,7 +461,7 @@ export function InventoryPage() {
       setNote('')
       setMessage('تم تنفيذ تعديل المخزون بنجاح.')
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'تعذر تنفيذ التعديل.')
+      setMessage(getUserFacingErrorMessage(error, 'تعذر تنفيذ التعديل.'))
     } finally {
       setIsSubmitting(false)
     }
@@ -351,11 +470,29 @@ export function InventoryPage() {
   const lowStockProducts = products.filter((product) => product.stockQty <= product.minStock)
   const pendingSalePricingProducts = products.filter((product) => isPendingSalePricing(product))
   const inventoryValue = products.reduce((sum, product) => sum + product.retailSalePrice * product.stockQty, 0)
+  const activeInventoryBatches = inventoryBatches.filter((batch) => batch.remainingQuantity > 0)
+  const expiryAlertsByProduct = new Map<string, ExpiryAlertSummary['alerts']>()
+  const batchesByProduct = new Map<string, InventoryBatch[]>()
+
+  for (const alert of expirySummary.alerts) {
+    const currentAlerts = expiryAlertsByProduct.get(alert.productId) ?? []
+    currentAlerts.push(alert)
+    expiryAlertsByProduct.set(alert.productId, currentAlerts)
+  }
+
+  for (const batch of activeInventoryBatches) {
+    const currentBatches = batchesByProduct.get(batch.productId) ?? []
+    currentBatches.push(batch)
+    batchesByProduct.set(batch.productId, currentBatches)
+  }
+
   const filteredProducts = products.filter((product) => {
     const normalizedQuery = productQuery.trim()
     const matchesQuery =
       normalizedQuery.length === 0 ||
       product.name.includes(normalizedQuery) ||
+      product.productFamilyName.includes(normalizedQuery) ||
+      product.variantLabel?.includes(normalizedQuery) ||
       product.barcode.includes(normalizedQuery) ||
       product.wholesaleBarcode?.includes(normalizedQuery) ||
       product.department.includes(normalizedQuery)
@@ -363,7 +500,9 @@ export function InventoryPage() {
     const matchesStockFilter =
       stockFilter === 'all' ||
       (stockFilter === 'low' && product.stockQty <= product.minStock) ||
-      (stockFilter === 'weighted' && Boolean(product.soldByWeight))
+      (stockFilter === 'weighted' && Boolean(product.soldByWeight)) ||
+      (stockFilter === 'expiry' && expiryAlertsByProduct.has(product.id)) ||
+      (stockFilter === 'unpriced' && isPendingSalePricing(product))
 
     return matchesQuery && matchesStockFilter
   })
@@ -379,6 +518,95 @@ export function InventoryPage() {
 
     return matchesQuery && matchesMovementFilter
   })
+  const filteredProductFamilies = Array.from(
+    filteredProducts.reduce((families, product) => {
+      const existingFamily = families.get(product.productFamilyName)
+
+      if (existingFamily) {
+        existingFamily.products.push(product)
+        existingFamily.variantCount += product.variantLabel ? 1 : 0
+        existingFamily.lowStockCount += product.stockQty <= product.minStock ? 1 : 0
+        existingFamily.totalStockQty += product.stockQty
+        existingFamily.totalInventoryValue += product.retailSalePrice * product.stockQty
+        existingFamily.hasExpiryAlert = existingFamily.hasExpiryAlert || expiryAlertsByProduct.has(product.id)
+        if (!existingFamily.departments.includes(product.department)) {
+          existingFamily.departments.push(product.department)
+        }
+        return families
+      }
+
+      families.set(product.productFamilyName, {
+        familyName: product.productFamilyName,
+        departments: [product.department],
+        products: [product],
+        variantCount: product.variantLabel ? 1 : 0,
+        lowStockCount: product.stockQty <= product.minStock ? 1 : 0,
+        totalStockQty: product.stockQty,
+        totalInventoryValue: product.retailSalePrice * product.stockQty,
+        hasExpiryAlert: expiryAlertsByProduct.has(product.id),
+      })
+
+      return families
+    }, new Map<string, ProductFamilyGroup>()),
+  )
+    .map(([, family]) => ({
+      ...family,
+      departments: family.departments.sort((left, right) => left.localeCompare(right, 'ar')),
+      products: family.products.slice().sort((left, right) => {
+        if (left.variantLabel && right.variantLabel) {
+          return left.variantLabel.localeCompare(right.variantLabel, 'ar')
+        }
+
+        if (left.variantLabel) {
+          return 1
+        }
+
+        if (right.variantLabel) {
+          return -1
+        }
+
+        return left.name.localeCompare(right.name, 'ar')
+      }),
+    }))
+    .sort((left, right) => left.familyName.localeCompare(right.familyName, 'ar'))
+  const productFamilyProfiles = Array.from(
+    products.reduce((profiles, product) => {
+      const existingProfile = profiles.get(product.productFamilyName)
+
+      if (existingProfile) {
+        if (product.variantLabel && !existingProfile.variantSuggestions.includes(product.variantLabel)) {
+          existingProfile.variantSuggestions.push(product.variantLabel)
+        }
+
+        existingProfile.skuCount += 1
+        existingProfile.totalStockQty += product.stockQty
+
+        return profiles
+      }
+
+      profiles.set(product.productFamilyName, {
+        familyName: product.productFamilyName,
+        variantSuggestions: product.variantLabel ? [product.variantLabel] : [],
+        department: product.department,
+        measurementType: product.measurementType,
+        purchaseCostBasis: product.purchaseCostBasis,
+        retailUnit: product.retailUnit,
+        wholesaleEnabled: Boolean(product.wholesaleUnit && product.wholesaleQuantity),
+        wholesaleUnit: product.wholesaleUnit ?? getWholesaleUnitOptions(product.measurementType)[0],
+        wholesaleQuantity: product.wholesaleQuantity ? String(product.wholesaleQuantity) : '',
+        vatRate: String(roundMoney(product.vatRate * 100)),
+        skuCount: 1,
+        totalStockQty: product.stockQty,
+      })
+
+      return profiles
+    }, new Map<string, ProductFamilyProfile>()),
+  )
+    .map(([, profile]) => ({
+      ...profile,
+      variantSuggestions: profile.variantSuggestions.sort((left, right) => left.localeCompare(right, 'ar')),
+    }))
+    .sort((left, right) => left.familyName.localeCompare(right.familyName, 'ar'))
   const latestPurchaseMovementByProduct = new Map<string, StockMovement>()
 
   for (const movement of movements) {
@@ -388,11 +616,323 @@ export function InventoryPage() {
   }
   const purchasedProductsCount = latestPurchaseMovementByProduct.size
 
+  function getFamilyProfileByName(productFamilyName: string) {
+    const normalizedFamilyName = productFamilyName.trim()
+    return productFamilyProfiles.find((profile) => profile.familyName === normalizedFamilyName) ?? null
+  }
+
+  function getVariantSuggestions(productFamilyName: string) {
+    return getFamilyProfileByName(productFamilyName)?.variantSuggestions ?? []
+  }
+
+  function getFamilyProducts(productFamilyName: string) {
+    const normalizedFamilyName = productFamilyName.trim()
+
+    if (!normalizedFamilyName) {
+      return []
+    }
+
+    return products
+      .filter((product) => product.productFamilyName === normalizedFamilyName)
+      .slice()
+      .sort((left, right) => left.name.localeCompare(right.name, 'ar'))
+  }
+
+  function getFamilySuggestionOptions() {
+    return productFamilyProfiles.map((profile) => ({
+      value: profile.familyName,
+      description: `${profile.department} | ${profile.measurementType === 'weight' ? 'وزني' : profile.wholesaleEnabled ? 'مفرد + جملة' : 'مفرد'}`,
+      meta: `${profile.skuCount} SKU | ${profile.variantSuggestions.length} أصناف فرعية | رصيد ${formatQuantity(profile.totalStockQty)}`,
+      searchTerms: profile.variantSuggestions,
+    }))
+  }
+
+  function getDepartmentSuggestionOptions() {
+    return Array.from(
+      products.reduce((departments, product) => {
+        const departmentName = product.department.trim()
+
+        if (!departmentName) {
+          return departments
+        }
+
+        const existingDepartment = departments.get(departmentName)
+
+        if (existingDepartment) {
+          existingDepartment.productsCount += 1
+          existingDepartment.families.add(product.productFamilyName)
+          return departments
+        }
+
+        departments.set(departmentName, {
+          name: departmentName,
+          productsCount: 1,
+          families: new Set([product.productFamilyName]),
+        })
+
+        return departments
+      }, new Map<string, { name: string; productsCount: number; families: Set<string> }>()),
+    )
+      .map(([, department]) => department)
+      .sort((left, right) => left.name.localeCompare(right.name, 'ar'))
+      .map((department) => ({
+        value: department.name,
+        title: department.name,
+        meta: `${department.productsCount} صنف | ${department.families.size} عائلة`,
+      }))
+  }
+
+  function getVariantSuggestionOptions(productFamilyName: string) {
+    return getFamilyProducts(productFamilyName)
+      .filter((product) => Boolean(product.variantLabel?.trim()))
+      .map((product) => ({
+        value: product.variantLabel?.trim() ?? '',
+        title: product.variantLabel?.trim() ?? '',
+        description: `باركود: ${product.barcode}`,
+        meta: `مخزون ${formatQuantity(product.stockQty)} ${product.retailUnit}`,
+      }))
+  }
+
+  function handleProductFamilyNameChange(name: string) {
+    const matchedProfile = getFamilyProfileByName(name)
+
+    if (!matchedProfile) {
+      setProductForm((current) => ({ ...current, name }))
+      return
+    }
+
+    setProductForm((current) => ({
+      ...current,
+      name,
+      department: matchedProfile.department,
+      measurementType: matchedProfile.measurementType,
+      purchaseCostBasis: matchedProfile.wholesaleEnabled ? matchedProfile.purchaseCostBasis : 'retail',
+      retailUnit: matchedProfile.retailUnit,
+      wholesaleEnabled: matchedProfile.wholesaleEnabled,
+      wholesaleUnit: matchedProfile.wholesaleUnit,
+      wholesaleQuantity: matchedProfile.wholesaleQuantity,
+      vatRate: matchedProfile.vatRate,
+    }))
+  }
+
+  function renderProductCard(product: Product) {
+    const latestPurchaseMovement = latestPurchaseMovementByProduct.get(product.id)
+    const productExpiryAlerts = expiryAlertsByProduct.get(product.id) ?? []
+    const productBatches = (batchesByProduct.get(product.id) ?? []).slice().sort((left, right) => {
+      if (left.expiryDate && right.expiryDate) {
+        return left.expiryDate.localeCompare(right.expiryDate)
+      }
+
+      if (left.expiryDate) {
+        return -1
+      }
+
+      if (right.expiryDate) {
+        return 1
+      }
+
+      return left.createdAt.localeCompare(right.createdAt)
+    })
+    const nearestExpiryAlert = productExpiryAlerts[0]
+
+    return (
+      <article key={product.id} className="rounded-[26px] border border-stone-200/80 bg-stone-50/80 p-4">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+          <div>
+            <div className="flex flex-wrap items-center gap-2">
+              <h3 className="font-display text-xl font-black text-stone-950">{product.name}</h3>
+              <span className="rounded-full bg-stone-900 px-3 py-1 text-xs font-black text-white">
+                {product.department}
+              </span>
+              <span className="rounded-full bg-teal-100 px-3 py-1 text-xs font-black text-teal-800">
+                {getPurchaseBasisLabel(product)}
+              </span>
+              {product.stockQty <= product.minStock ? (
+                <span className="rounded-full bg-amber-100 px-3 py-1 text-xs font-black text-amber-800">
+                  تنبيه حد أدنى
+                </span>
+              ) : null}
+              {nearestExpiryAlert ? (
+                <span className={`rounded-full px-3 py-1 text-xs font-black ${getExpiryBadgeClasses(nearestExpiryAlert.severity)}`}>
+                  {nearestExpiryAlert.severity === 'expired'
+                    ? 'دفعة منتهية'
+                    : nearestExpiryAlert.severity === 'critical'
+                      ? 'دفعة تنتهي خلال 7 أيام'
+                      : 'دفعة تنتهي خلال 30 يوماً'}
+                </span>
+              ) : null}
+              {isPendingSalePricing(product) ? (
+                <span className="rounded-full bg-rose-100 px-3 py-1 text-xs font-black text-rose-800">
+                  يحتاج تسعير بيع
+                </span>
+              ) : (
+                <span className="rounded-full bg-emerald-100 px-3 py-1 text-xs font-black text-emerald-800">
+                  جاهز للبيع
+                </span>
+              )}
+            </div>
+            {product.variantLabel ? (
+              <p className="mt-2 text-sm font-bold text-stone-700">
+                المنتج الرئيسي: {product.productFamilyName}
+                <span className="mx-2 text-stone-400">|</span>
+                الصنف الفرعي: {product.variantLabel}
+              </p>
+            ) : null}
+            <p className="mt-2 text-sm text-stone-600">
+              باركود المفرد: {product.barcode}
+              {product.wholesaleBarcode ? (
+                <>
+                  <span className="mx-2 text-stone-400">|</span>
+                  باركود الجملة: {product.wholesaleBarcode}
+                </>
+              ) : null}
+              <span className="mx-2 text-stone-400">|</span>
+              نوع الصنف: {product.measurementType === 'weight' ? 'وزني' : product.wholesaleUnit ? 'مفرد + جملة' : 'مفرد'}
+              <span className="mx-2 text-stone-400">|</span>
+              تكلفة المفرد: {formatMoney(product.retailPurchasePrice, 'IQD')}
+              <span className="mx-2 text-stone-400">|</span>
+              سعر مفرد: {formatMoney(product.retailSalePrice, 'IQD')}
+              <span className="mx-2 text-stone-400">|</span>
+              الحد الأدنى: {formatQuantity(product.minStock)} {product.retailUnit}
+            </p>
+            <p className="mt-2 text-sm text-stone-500">
+              وحدة المفرد: {product.retailUnit}
+              {product.wholesaleUnit && product.wholesaleQuantity ? ` | وحدة الجملة: ${product.wholesaleUnit} = ${formatQuantity(product.wholesaleQuantity)} ${product.retailUnit}` : ''}
+              {product.wholesaleSalePrice ? ` | سعر الجملة: ${formatMoney(product.wholesaleSalePrice, 'IQD')}` : ''}
+              {product.wholesalePurchasePrice ? ` | تكلفة الجملة: ${formatMoney(product.wholesalePurchasePrice, 'IQD')}` : ''}
+            </p>
+            <div className="mt-3 rounded-2xl border border-stone-200 bg-white/80 px-4 py-3 text-sm text-stone-700 shadow-sm">
+              <p className="font-black text-stone-900">بيانات الإدخال من المشتريات</p>
+              <p className="mt-1">
+                {getInventoryWorkflowHint(product)}
+              </p>
+              <p className="mt-1 text-stone-500">
+                تكلفة المفرد الحالية {formatMoney(product.retailPurchasePrice, 'IQD')}
+                {product.wholesalePurchasePrice ? `، وتكلفة الجملة ${formatMoney(product.wholesalePurchasePrice, 'IQD')}` : ''}
+                {product.wholesaleBarcode ? '، مع حفظ باركود الجملة للمسح المباشر.' : '، مع حفظ باركود المفرد فقط لهذا الصنف.'}
+              </p>
+              {nearestExpiryAlert ? (
+                <div className={`mt-3 grid gap-2 rounded-2xl border px-3 py-3 text-sm ${getExpiryCardClasses(nearestExpiryAlert.severity)} md:grid-cols-2`}>
+                  <p>
+                    <span className="font-black">أقرب انتهاء:</span>{' '}
+                    {formatDate(nearestExpiryAlert.expiryDate)}
+                  </p>
+                  <p>
+                    <span className="font-black">الحالة:</span>{' '}
+                    {getExpiryLabel(nearestExpiryAlert.daysUntilExpiry)}
+                  </p>
+                  <p>
+                    <span className="font-black">مرجع الدفعة:</span>{' '}
+                    {nearestExpiryAlert.receiptNo}
+                  </p>
+                  <p>
+                    <span className="font-black">التشغيلة:</span>{' '}
+                    {nearestExpiryAlert.batchNo || 'غير مسجلة'}
+                  </p>
+                </div>
+              ) : null}
+              {productBatches.length ? (
+                <div className="mt-3 rounded-2xl border border-stone-200 bg-white/90 px-4 py-3 shadow-sm">
+                  <div className="flex items-center justify-between gap-3">
+                    <p className="font-black text-stone-900">الدفعات المتبقية</p>
+                    <span className="rounded-full bg-emerald-100 px-3 py-1 text-xs font-black text-emerald-800">
+                      {productBatches.length} دفعة
+                    </span>
+                  </div>
+                  <div className="mt-3 grid gap-2 xl:grid-cols-2">
+                    {productBatches.slice(0, 4).map((batch) => (
+                      <div key={batch.id} className="rounded-2xl border border-stone-200 bg-stone-50/90 px-3 py-3 text-sm text-stone-700">
+                        <p className="font-black text-stone-900">
+                          {batch.source === 'opening' ? 'رصيد افتتاحي' : batch.batchNo || 'دفعة شراء'}
+                        </p>
+                        <p className="mt-1">
+                          المتبقي: {formatQuantity(batch.remainingQuantity)} {product.retailUnit}
+                        </p>
+                        <p className="mt-1 text-xs text-stone-500">
+                          تاريخ الشراء: {batch.purchaseDate ? formatDate(batch.purchaseDate) : 'غير محدد'}
+                        </p>
+                        <p className="mt-1 text-xs text-stone-500">
+                          الانتهاء: {batch.expiryDate ? formatDate(batch.expiryDate) : 'بدون تاريخ انتهاء'}
+                        </p>
+                        <p className="mt-1 text-xs text-stone-500">
+                          المورد: {batch.supplierName || 'غير محدد'}
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                  {productBatches.length > 4 ? (
+                    <p className="mt-2 text-xs font-bold text-stone-500">
+                      تم عرض أول 4 دفعات، وباقي الدفعات محفوظة في النظام.
+                    </p>
+                  ) : null}
+                </div>
+              ) : null}
+              {latestPurchaseMovement ? (
+                <div className="mt-3 grid gap-2 rounded-2xl border border-emerald-200 bg-emerald-50/80 px-3 py-3 text-sm text-stone-700 md:grid-cols-2">
+                  <p>
+                    <span className="font-black text-stone-900">آخر توريد:</span>{' '}
+                    {formatDate(latestPurchaseMovement.createdAt)}
+                  </p>
+                  <p>
+                    <span className="font-black text-stone-900">الكمية المستلمة:</span>{' '}
+                    +{formatQuantity(latestPurchaseMovement.quantityDelta)} {product.retailUnit}
+                  </p>
+                  <p className="md:col-span-2">
+                    <span className="font-black text-stone-900">مرجع التوريد:</span>{' '}
+                    {latestPurchaseMovement.note}
+                  </p>
+                  <p>
+                    <span className="font-black text-stone-900">الرصيد بعد التوريد:</span>{' '}
+                    {formatQuantity(latestPurchaseMovement.balanceAfter)} {product.retailUnit}
+                  </p>
+                  <p>
+                    <span className="font-black text-stone-900">أساس الكلفة:</span>{' '}
+                    {product.purchaseCostBasis === 'wholesale' ? 'تم اعتماد الجملة ثم اشتقاق المفرد' : 'تم اعتماد المفرد مباشرة'}
+                  </p>
+                </div>
+              ) : (
+                <p className="mt-2 text-stone-500">
+                  لم تُسجل لهذا الصنف حركة شراء بعد، وقد يكون رصيده افتتاحياً أو أُضيف يدوياً من شاشة المخزون.
+                </p>
+              )}
+            </div>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="min-w-48 rounded-2xl bg-white px-4 py-4 text-left">
+              <p className="text-xs text-stone-500">الرصيد الحالي</p>
+              <p className="mt-1 font-display text-2xl font-black text-teal-700">
+                {formatQuantity(product.stockQty)} {product.retailUnit}
+              </p>
+            </div>
+            <button
+              className="rounded-full border border-stone-300 px-4 py-2 text-sm font-black text-stone-700 transition hover:border-teal-500 hover:text-teal-700"
+              onClick={() => startEditingProduct(product)}
+              type="button"
+            >
+              تعديل
+            </button>
+            <button
+              className="rounded-full border border-rose-300 px-4 py-2 text-sm font-black text-rose-700 transition hover:border-rose-500 hover:text-rose-800 disabled:cursor-not-allowed disabled:border-rose-200 disabled:text-rose-300"
+              disabled={isSubmitting}
+              onClick={() => void handleDeleteProduct(product.id)}
+              type="button"
+            >
+              حذف
+            </button>
+          </div>
+        </div>
+      </article>
+    )
+  }
+
   function handleExportProducts() {
     exportRowsToCsv({
       fileName: `super-m2-products-${new Date().toISOString().slice(0, 10)}.csv`,
       headers: [
         'name',
+        'product_family_name',
+        'variant_label',
         'barcode',
         'wholesale_barcode',
         'plu',
@@ -418,6 +958,8 @@ export function InventoryPage() {
 
         return [
           product.name,
+          product.productFamilyName,
+          product.variantLabel ?? '',
           product.barcode,
           product.wholesaleBarcode ?? '',
           product.plu ?? '',
@@ -499,8 +1041,13 @@ export function InventoryPage() {
               >
                 تحديث البيانات
               </button>
-              <Link className="rounded-full border border-stone-300 px-4 py-2 text-sm font-black text-stone-700 transition hover:border-teal-500 hover:text-teal-700" to="/pos">
-                العودة إلى الكاشير
+              {session?.employee.role === 'admin' ? (
+                <Link className="rounded-full border border-stone-300 px-4 py-2 text-sm font-black text-stone-700 transition hover:border-teal-500 hover:text-teal-700" to="/pos">
+                  العودة إلى الكاشير
+                </Link>
+              ) : null}
+              <Link className="rounded-full border border-stone-300 px-4 py-2 text-sm font-black text-stone-700 transition hover:border-rose-500 hover:text-rose-700" to="/batches">
+                الدفعات والصلاحيات
               </Link>
             </div>
           </div>
@@ -513,11 +1060,16 @@ export function InventoryPage() {
             <p className="mt-2 text-sm text-stone-600">أصناف متاحة حالياً في الكتالوج</p>
           </article>
           <article className="rounded-[28px] border border-white/70 bg-white/82 p-5 shadow-[0_24px_80px_rgba(77,60,27,0.10)] backdrop-blur-xl">
+            <p className="text-sm font-black tracking-[0.2em] text-sky-700">FAMILIES</p>
+            <p className="mt-3 font-display text-4xl font-black text-stone-950">{filteredProductFamilies.length}</p>
+            <p className="mt-2 text-sm text-stone-600">عائلات منتجات ظاهرة حسب الفلتر الحالي</p>
+          </article>
+          <article className="rounded-[28px] border border-white/70 bg-white/82 p-5 shadow-[0_24px_80px_rgba(77,60,27,0.10)] backdrop-blur-xl">
             <p className="text-sm font-black tracking-[0.2em] text-amber-700">LOW STOCK</p>
             <p className="mt-3 font-display text-4xl font-black text-stone-950">{lowStockProducts.length}</p>
             <p className="mt-2 text-sm text-stone-600">أصناف عند أو تحت حد إعادة الطلب</p>
           </article>
-          <article className="rounded-[28px] border border-white/70 bg-[linear-gradient(180deg,#101826_0%,#172436_100%)] p-5 text-white shadow-[0_28px_90px_rgba(17,24,39,0.18)]">
+          <article className="rounded-[28px] border border-white/70 bg-[linear-gradient(180deg,#101826_0%,#172436_100%)] p-5 text-white shadow-[0_28px_90px_rgba(17,24,39,0.18)] md:col-span-3">
             <p className="text-sm font-black tracking-[0.2em] text-teal-200/80">ESTIMATED VALUE</p>
             <p className="mt-3 font-display text-4xl font-black">{formatMoney(inventoryValue, 'IQD')}</p>
             <p className="mt-2 text-sm text-stone-300">قيمة تقديرية حسب سعر البيع الحالي</p>
@@ -543,11 +1095,7 @@ export function InventoryPage() {
           </div>
         </section>
 
-        {message ? (
-          <section className="mt-6 rounded-[24px] border border-teal-300/40 bg-teal-50 px-5 py-4 text-sm font-bold text-teal-800">
-            {message}
-          </section>
-        ) : null}
+        <FeedbackMessage message={message} onClear={() => setMessage(null)} />
 
         <section className="mt-6 grid gap-6 xl:grid-cols-[1fr_0.9fr]">
           <section className="rounded-[32px] border border-white/70 bg-white/82 p-5 shadow-[0_24px_80px_rgba(77,60,27,0.10)] backdrop-blur-xl sm:p-6">
@@ -587,6 +1135,89 @@ export function InventoryPage() {
                 >
                   أصناف وزنية
                 </button>
+                <button
+                  className={`rounded-full px-4 py-2 text-sm font-black transition ${stockFilter === 'expiry' ? 'bg-rose-600 text-white' : 'border border-stone-300 text-stone-700 hover:border-rose-500 hover:text-rose-700'}`}
+                  onClick={() => setStockFilter('expiry')}
+                  type="button"
+                >
+                  قرب الانتهاء
+                </button>
+                <button
+                  className={`rounded-full px-4 py-2 text-sm font-black transition ${stockFilter === 'unpriced' ? 'bg-orange-500 text-white' : 'border border-stone-300 text-stone-700 hover:border-orange-500 hover:text-orange-700'}`}
+                  onClick={() => setStockFilter('unpriced')}
+                  type="button"
+                >
+                  غير مسعر
+                </button>
+              </div>
+            </div>
+
+            <div className="mt-5 rounded-[24px] border border-rose-200 bg-[linear-gradient(180deg,#fff7f7_0%,#fff1f2_100%)] p-4 shadow-[0_18px_50px_rgba(159,18,57,0.08)]">
+              <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                <div>
+                  <p className="text-sm font-black tracking-[0.2em] text-rose-700">EXPIRY CONTROL</p>
+                  <p className="mt-2 text-sm font-bold text-stone-700">
+                    تنبيه الصلاحية يعتمد على دفعات الشراء المسجلة ذات الرصيد المتبقي حالياً، ليس صرف دفعات تلقائياً بعد.
+                  </p>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-4">
+                  <div className="rounded-2xl border border-rose-200 bg-white/85 px-4 py-3 text-left">
+                    <p className="text-xs font-black tracking-[0.18em] text-rose-700">EXPIRED</p>
+                    <p className="mt-1 font-display text-2xl font-black text-rose-900">{expirySummary.expiredCount}</p>
+                  </div>
+                  <div className="rounded-2xl border border-amber-200 bg-white/85 px-4 py-3 text-left">
+                    <p className="text-xs font-black tracking-[0.18em] text-amber-700">WITHIN 7 DAYS</p>
+                    <p className="mt-1 font-display text-2xl font-black text-amber-900">{expirySummary.criticalCount}</p>
+                  </div>
+                  <div className="rounded-2xl border border-sky-200 bg-white/85 px-4 py-3 text-left">
+                    <p className="text-xs font-black tracking-[0.18em] text-sky-700">WITHIN 30 DAYS</p>
+                    <p className="mt-1 font-display text-2xl font-black text-sky-900">{expirySummary.warningCount}</p>
+                  </div>
+                  <div className="rounded-2xl border border-stone-200 bg-white/85 px-4 py-3 text-left">
+                    <p className="text-xs font-black tracking-[0.18em] text-stone-500">AFFECTED PRODUCTS</p>
+                    <p className="mt-1 font-display text-2xl font-black text-stone-900">{expirySummary.affectedProductsCount}</p>
+                  </div>
+                  <div className="rounded-2xl border border-emerald-200 bg-white/85 px-4 py-3 text-left sm:col-span-4 xl:col-span-1">
+                    <p className="text-xs font-black tracking-[0.18em] text-emerald-700">ACTIVE BATCHES</p>
+                    <p className="mt-1 font-display text-2xl font-black text-emerald-900">{activeInventoryBatches.length}</p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="mt-4 grid gap-3 xl:grid-cols-2">
+                {expirySummary.alerts.length ? (
+                  expirySummary.alerts.slice(0, 8).map((alert) => (
+                    <article key={alert.key} className={`rounded-2xl border px-4 py-4 ${getExpiryCardClasses(alert.severity)}`}>
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <p className="font-bold">{alert.productName}</p>
+                            <span className={`rounded-full px-3 py-1 text-xs font-black ${getExpiryBadgeClasses(alert.severity)}`}>
+                              {alert.severity === 'expired' ? 'منتهي' : alert.severity === 'critical' ? 'حرج' : 'متابعة'}
+                            </span>
+                          </div>
+                          <p className="mt-2 text-sm">
+                            الانتهاء: {formatDate(alert.expiryDate)}
+                            <span className="mx-2 text-stone-400">|</span>
+                            {getExpiryLabel(alert.daysUntilExpiry)}
+                          </p>
+                          <p className="mt-1 text-xs opacity-80">
+                            {alert.batchNo ? `التشغيلة: ${alert.batchNo} | ` : ''}
+                            السند: {alert.receiptNo}
+                          </p>
+                        </div>
+                        <div className="text-left">
+                          <p className="font-display text-xl font-black">{formatQuantity(alert.remainingStockQty)} {alert.unitLabel}</p>
+                          <p className="text-xs font-bold opacity-75">رصيد الصنف الحالي</p>
+                        </div>
+                      </div>
+                    </article>
+                  ))
+                ) : (
+                  <div className="rounded-2xl border border-dashed border-stone-300 bg-white/80 px-5 py-8 text-center text-stone-500 xl:col-span-2">
+                    لا توجد دفعات تحتاج متابعة صلاحية حالياً.
+                  </div>
+                )}
               </div>
             </div>
 
@@ -595,131 +1226,65 @@ export function InventoryPage() {
                 <div className="rounded-[24px] border border-dashed border-stone-300 bg-stone-50 px-5 py-10 text-center text-stone-500">
                   جارٍ تحميل المخزون...
                 </div>
-              ) : filteredProducts.length === 0 ? (
+              ) : filteredProductFamilies.length === 0 ? (
                 <div className="rounded-[24px] border border-dashed border-stone-300 bg-stone-50 px-5 py-10 text-center text-stone-500">
                   لا توجد أصناف تطابق الفلتر الحالي.
                 </div>
               ) : (
-                filteredProducts.map((product) => {
-                  const latestPurchaseMovement = latestPurchaseMovementByProduct.get(product.id)
-
-                  return (
-                  <article key={product.id} className="rounded-[26px] border border-stone-200/80 bg-stone-50/80 p-4">
-                    <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
+                filteredProductFamilies.map((family) => (
+                  <section key={family.familyName} className="rounded-[28px] border border-stone-200 bg-[linear-gradient(180deg,#fffdf8_0%,#f7f1e5_100%)] p-4 shadow-[0_18px_50px_rgba(120,89,26,0.08)]">
+                    <div className="flex flex-col gap-4 rounded-[24px] border border-white/80 bg-white/75 px-4 py-4 shadow-sm lg:flex-row lg:items-center lg:justify-between">
                       <div>
                         <div className="flex flex-wrap items-center gap-2">
-                          <h3 className="font-display text-xl font-black text-stone-950">{product.name}</h3>
+                          <h3 className="font-display text-2xl font-black text-stone-950">{family.familyName}</h3>
                           <span className="rounded-full bg-stone-900 px-3 py-1 text-xs font-black text-white">
-                            {product.department}
+                            {family.products.length} SKU
                           </span>
-                          <span className="rounded-full bg-teal-100 px-3 py-1 text-xs font-black text-teal-800">
-                            {getPurchaseBasisLabel(product)}
-                          </span>
-                          {product.stockQty <= product.minStock ? (
+                          {family.variantCount > 0 ? (
+                            <span className="rounded-full bg-sky-100 px-3 py-1 text-xs font-black text-sky-800">
+                              {family.variantCount} أصناف فرعية
+                            </span>
+                          ) : null}
+                          {family.lowStockCount > 0 ? (
                             <span className="rounded-full bg-amber-100 px-3 py-1 text-xs font-black text-amber-800">
-                              تنبيه حد أدنى
+                              {family.lowStockCount} منخفضة المخزون
                             </span>
                           ) : null}
-                          {isPendingSalePricing(product) ? (
+                          {family.hasExpiryAlert ? (
                             <span className="rounded-full bg-rose-100 px-3 py-1 text-xs font-black text-rose-800">
-                              يحتاج تسعير بيع
+                              توجد دفعات تحتاج متابعة
                             </span>
-                          ) : (
-                            <span className="rounded-full bg-emerald-100 px-3 py-1 text-xs font-black text-emerald-800">
-                              جاهز للبيع
-                            </span>
-                          )}
-                        </div>
-                        <p className="mt-2 text-sm text-stone-600">
-                          باركود المفرد: {product.barcode}
-                          {product.wholesaleBarcode ? (
-                            <>
-                              <span className="mx-2 text-stone-400">|</span>
-                              باركود الجملة: {product.wholesaleBarcode}
-                            </>
                           ) : null}
-                          <span className="mx-2 text-stone-400">|</span>
-                          نوع الصنف: {product.measurementType === 'weight' ? 'وزني' : product.wholesaleUnit ? 'مفرد + جملة' : 'مفرد'}
-                          <span className="mx-2 text-stone-400">|</span>
-                          تكلفة المفرد: {formatMoney(product.retailPurchasePrice, 'IQD')}
-                          <span className="mx-2 text-stone-400">|</span>
-                          سعر مفرد: {formatMoney(product.retailSalePrice, 'IQD')}
-                          <span className="mx-2 text-stone-400">|</span>
-                          الحد الأدنى: {formatQuantity(product.minStock)} {product.retailUnit}
-                        </p>
-                        <p className="mt-2 text-sm text-stone-500">
-                          وحدة المفرد: {product.retailUnit}
-                          {product.wholesaleUnit && product.wholesaleQuantity ? ` | وحدة الجملة: ${product.wholesaleUnit} = ${formatQuantity(product.wholesaleQuantity)} ${product.retailUnit}` : ''}
-                          {product.wholesaleSalePrice ? ` | سعر الجملة: ${formatMoney(product.wholesaleSalePrice, 'IQD')}` : ''}
-                          {product.wholesalePurchasePrice ? ` | تكلفة الجملة: ${formatMoney(product.wholesalePurchasePrice, 'IQD')}` : ''}
-                        </p>
-                        <div className="mt-3 rounded-2xl border border-stone-200 bg-white/80 px-4 py-3 text-sm text-stone-700 shadow-sm">
-                          <p className="font-black text-stone-900">بيانات الإدخال من المشتريات</p>
-                          <p className="mt-1">
-                            {getInventoryWorkflowHint(product)}
-                          </p>
-                          <p className="mt-1 text-stone-500">
-                            تكلفة المفرد الحالية {formatMoney(product.retailPurchasePrice, 'IQD')}
-                            {product.wholesalePurchasePrice ? `، وتكلفة الجملة ${formatMoney(product.wholesalePurchasePrice, 'IQD')}` : ''}
-                            {product.wholesaleBarcode ? '، مع حفظ باركود الجملة للمسح المباشر.' : '، مع حفظ باركود المفرد فقط لهذا الصنف.'}
-                          </p>
-                          {latestPurchaseMovement ? (
-                            <div className="mt-3 grid gap-2 rounded-2xl border border-emerald-200 bg-emerald-50/80 px-3 py-3 text-sm text-stone-700 md:grid-cols-2">
-                              <p>
-                                <span className="font-black text-stone-900">آخر توريد:</span>{' '}
-                                {formatDate(latestPurchaseMovement.createdAt)}
-                              </p>
-                              <p>
-                                <span className="font-black text-stone-900">الكمية المستلمة:</span>{' '}
-                                +{formatQuantity(latestPurchaseMovement.quantityDelta)} {product.retailUnit}
-                              </p>
-                              <p className="md:col-span-2">
-                                <span className="font-black text-stone-900">مرجع التوريد:</span>{' '}
-                                {latestPurchaseMovement.note}
-                              </p>
-                              <p>
-                                <span className="font-black text-stone-900">الرصيد بعد التوريد:</span>{' '}
-                                {formatQuantity(latestPurchaseMovement.balanceAfter)} {product.retailUnit}
-                              </p>
-                              <p>
-                                <span className="font-black text-stone-900">أساس الكلفة:</span>{' '}
-                                {product.purchaseCostBasis === 'wholesale' ? 'تم اعتماد الجملة ثم اشتقاق المفرد' : 'تم اعتماد المفرد مباشرة'}
-                              </p>
-                            </div>
-                          ) : (
-                            <p className="mt-2 text-stone-500">
-                              لم تُسجل لهذا الصنف حركة شراء بعد، وقد يكون رصيده افتتاحياً أو أُضيف يدوياً من شاشة المخزون.
-                            </p>
-                          )}
                         </div>
+                        <p className="mt-2 text-sm font-bold text-stone-600">
+                          الأقسام: {family.departments.join('، ')}
+                        </p>
                       </div>
-
-                      <div className="flex flex-wrap items-center gap-3">
-                        <div className="min-w-48 rounded-2xl bg-white px-4 py-4 text-left">
-                          <p className="text-xs text-stone-500">الرصيد الحالي</p>
-                          <p className="mt-1 font-display text-2xl font-black text-teal-700">
-                            {formatQuantity(product.stockQty)} {product.retailUnit}
-                          </p>
+                      <div className="flex flex-col gap-3 lg:min-w-[360px]">
+                        <button
+                          className="rounded-full border border-teal-500/30 bg-teal-500/10 px-4 py-2 text-sm font-black text-teal-700 transition hover:border-teal-500 hover:bg-teal-500/15"
+                          onClick={() => startNewVariantForFamily(family.familyName)}
+                          type="button"
+                        >
+                          إضافة صنف فرعي جديد لهذه العائلة
+                        </button>
+                        <div className="grid gap-3 sm:grid-cols-2">
+                          <div className="rounded-2xl bg-stone-50 px-4 py-3 text-left">
+                            <p className="text-xs font-black tracking-[0.18em] text-stone-500">TOTAL STOCK</p>
+                            <p className="mt-1 font-display text-2xl font-black text-teal-700">{formatQuantity(family.totalStockQty)}</p>
+                          </div>
+                          <div className="rounded-2xl bg-stone-50 px-4 py-3 text-left">
+                            <p className="text-xs font-black tracking-[0.18em] text-stone-500">FAMILY VALUE</p>
+                            <p className="mt-1 font-display text-2xl font-black text-stone-950">{formatMoney(family.totalInventoryValue, 'IQD')}</p>
+                          </div>
                         </div>
-                        <button
-                          className="rounded-full border border-stone-300 px-4 py-2 text-sm font-black text-stone-700 transition hover:border-teal-500 hover:text-teal-700"
-                          onClick={() => startEditingProduct(product)}
-                          type="button"
-                        >
-                          تعديل
-                        </button>
-                        <button
-                          className="rounded-full border border-rose-300 px-4 py-2 text-sm font-black text-rose-700 transition hover:border-rose-500 hover:text-rose-800 disabled:cursor-not-allowed disabled:border-rose-200 disabled:text-rose-300"
-                          disabled={isSubmitting}
-                          onClick={() => void handleDeleteProduct(product.id)}
-                          type="button"
-                        >
-                          حذف
-                        </button>
                       </div>
                     </div>
-                  </article>
-                )})
+                    <div className="mt-4 space-y-4">
+                      {family.products.map((product) => renderProductCard(product))}
+                    </div>
+                  </section>
+                ))
               )}
             </div>
           </section>
@@ -746,21 +1311,73 @@ export function InventoryPage() {
 
               <form className="mt-5 grid gap-4" onSubmit={handleProductSubmit}>
                 <div className="grid gap-4 sm:grid-cols-2">
-                  <label className="text-sm font-bold text-stone-200">
-                    اسم الصنف
-                    <input
-                      className="mt-2 h-12 w-full rounded-2xl border border-white/10 bg-black/20 px-4 text-right text-base text-white outline-none placeholder:text-stone-400 focus:border-teal-400"
-                      value={productForm.name}
-                      onChange={(event) => setProductForm((current) => ({ ...current, name: event.target.value }))}
-                    />
-                  </label>
+                  {(() => {
+                    const familyProfile = getFamilyProfileByName(productForm.name)
+                    const variantSuggestions = getVariantSuggestions(productForm.name)
+
+                    return (
+                      <>
+                        <label className="text-sm font-bold text-stone-200">
+                          اسم المنتج الرئيسي
+                          <SuggestionInput
+                            emptyStateClassName="px-4 py-3 text-right text-xs font-bold text-stone-400"
+                            inputClassName="h-12 w-full rounded-2xl border border-white/10 bg-black/20 px-4 text-right text-base text-white outline-none placeholder:text-stone-400 focus:border-teal-400"
+                            optionClassName="w-full px-4 py-3 text-right text-sm font-bold text-stone-100 transition hover:bg-teal-500/20 hover:text-teal-100"
+                            panelClassName="absolute left-0 right-0 top-full z-20 mt-2 overflow-hidden rounded-2xl border border-white/10 bg-slate-950/95 shadow-[0_24px_80px_rgba(15,23,42,0.55)] backdrop-blur"
+                            placeholder="ابدأ بكتابة اسم مثل جل أو شاي"
+                            suggestions={getFamilySuggestionOptions()}
+                            value={productForm.name}
+                            onChange={handleProductFamilyNameChange}
+                          />
+                          {familyProfile ? <span className="mt-2 block text-xs font-black text-teal-200">تم العثور على عائلة محفوظة وسيتم إعادة استخدام القسم والوحدات والضريبة الخاصة بها.</span> : <span className="mt-2 block text-xs font-bold text-stone-400">إذا كان المنتج الرئيسي مدخلاً سابقاً فسيظهر لك ضمن الاقتراحات أثناء الكتابة.</span>}
+                        </label>
+                        <label className="text-sm font-bold text-stone-200">
+                          الصنف الفرعي / النكهة / اللون
+                          <SuggestionInput
+                            emptyStateClassName="px-4 py-3 text-right text-xs font-bold text-stone-400"
+                            inputClassName="h-12 w-full rounded-2xl border border-white/10 bg-black/20 px-4 text-right text-base text-white outline-none placeholder:text-stone-400 focus:border-teal-400"
+                            optionClassName="w-full px-4 py-3 text-right text-sm font-bold text-stone-100 transition hover:bg-teal-500/20 hover:text-teal-100"
+                            panelClassName="absolute left-0 right-0 top-full z-20 mt-2 overflow-hidden rounded-2xl border border-white/10 bg-slate-950/95 shadow-[0_24px_80px_rgba(15,23,42,0.55)] backdrop-blur"
+                            placeholder="مثال: ياسمين أو ورد أو أزرق"
+                            suggestions={getVariantSuggestionOptions(productForm.name)}
+                            value={productForm.variantLabel}
+                            onChange={(nextValue) => setProductForm((current) => ({ ...current, variantLabel: nextValue }))}
+                          />
+                          {variantSuggestions.length ? <span className="mt-2 block text-xs font-black text-teal-200">الأصناف الفرعية السابقة لهذه العائلة: {variantSuggestions.join('، ')}</span> : <span className="mt-2 block text-xs font-bold text-stone-400">عند اختيار عائلة موجودة ستظهر هنا اقتراحات النكهات أو الألوان أو المقاسات السابقة لها.</span>}
+                        </label>
+                      </>
+                    )
+                  })()}
+                </div>
+
+                <div className="rounded-2xl border border-white/10 bg-black/15 px-4 py-3 text-sm font-bold text-stone-200">
+                  اسم الـ SKU الناتج: {buildProductDisplayName(productForm.name || 'المنتج الرئيسي', productForm.variantLabel || undefined)}
+                </div>
+
+                <FamilyVariantsPanel
+                  actionLabel={getFamilyProfileByName(productForm.name) ? 'تهيئة صنف فرعي جديد' : undefined}
+                  activeVariantLabel={productForm.variantLabel}
+                  familyName={productForm.name}
+                  helperText="هذه اللوحة تعرض كل ما هو محفوظ تحت العائلة نفسها حتى لا يتكرر إدخال نفس Variant أو يختلف اسمه عن السابق."
+                  onAction={getFamilyProfileByName(productForm.name) ? () => startNewVariantForFamily(productForm.name) : undefined}
+                  products={getFamilyProducts(productForm.name)}
+                  title="الأصناف الحالية لهذه العائلة"
+                />
+
+                <div className="grid gap-4 sm:grid-cols-2">
                   <label className="text-sm font-bold text-stone-200">
                     القسم
-                    <input
-                      className="mt-2 h-12 w-full rounded-2xl border border-white/10 bg-black/20 px-4 text-right text-base text-white outline-none placeholder:text-stone-400 focus:border-teal-400"
+                    <SuggestionInput
+                      emptyStateClassName="px-4 py-3 text-right text-xs font-bold text-stone-400"
+                      inputClassName="h-12 w-full rounded-2xl border border-white/10 bg-black/20 px-4 text-right text-base text-white outline-none placeholder:text-stone-400 focus:border-teal-400"
+                      optionClassName="w-full border-b border-white/5 px-4 py-3 text-right text-sm font-bold text-stone-100 transition last:border-b-0 hover:bg-teal-500/20 hover:text-teal-100"
+                      panelClassName="absolute right-0 top-full z-20 mt-2 min-w-[280px] max-w-[360px] overflow-hidden rounded-2xl border border-white/10 bg-slate-950/95 shadow-[0_24px_80px_rgba(15,23,42,0.55)] backdrop-blur"
+                      placeholder="اختر قسماً موجوداً أو اكتب قسماً جديداً"
+                      suggestions={getDepartmentSuggestionOptions()}
                       value={productForm.department}
-                      onChange={(event) => setProductForm((current) => ({ ...current, department: event.target.value }))}
+                      onChange={(nextValue) => setProductForm((current) => ({ ...current, department: nextValue }))}
                     />
+                    <span className="mt-2 block text-xs font-bold text-stone-400">ستظهر هنا الأقسام المستخدمة سابقاً لتوحيد الإدخال وتقليل اختلاف المسميات.</span>
                   </label>
                 </div>
 

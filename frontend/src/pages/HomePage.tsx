@@ -1,4 +1,7 @@
 import { Link } from 'react-router-dom'
+import { useEmployeeSession } from '../lib/auth'
+import { hasPermission } from '../lib/permissions'
+import { useSystemSettings } from '../lib/system-settings'
 
 const quickStats = [
   {
@@ -7,14 +10,14 @@ const quickStats = [
     detail: 'واجهة مصممة للمس وشاشات الكاشير والعمل أثناء الضغط.',
   },
   {
-    value: 'FIFO',
+    value: 'FEFO',
     label: 'إدارة الصلاحية والدفعات',
     detail: 'تنبيهات انتهاء الصلاحية وتصريف تلقائي حسب الأقدم فالأحدث.',
   },
   {
-    value: 'IQD / USD',
-    label: 'دعم عملتين',
-    detail: 'البيع بالدينار العراقي مع عرض وتحويل مرجعي فوري إلى الدولار الأمريكي.',
+    value: 'CENTRAL',
+    label: 'إدارة مركزية وشبكة كاشير',
+    detail: 'حاسبة إدارة مركزية واحدة مع نقاط بيع POS ترتبط بها عبر الشبكة السلكية أو اللاسلكية.',
   },
 ] as const
 
@@ -37,7 +40,7 @@ const modules = [
   },
   {
     title: 'الموظفون والصلاحيات',
-    body: 'أدوار دقيقة للكاشير وأمين المخزن والمدير مع فصل واضح بين العرض والتعديل.',
+    body: 'أدوار دقيقة للكاشير وأمين المخزن والمحاسب والمدير مع فصل واضح بين العرض والتعديل.',
   },
   {
     title: 'العملاء والتقارير',
@@ -73,7 +76,58 @@ const milestones = [
   'لوحات التقارير، الفروع المتعددة، والمحاسبة المتقدمة وصلاحيات المستخدمين.',
 ] as const
 
+const actionCardStyles = [
+  'border-teal-200/80 hover:border-teal-400 hover:bg-teal-50/70',
+  'border-emerald-200/80 hover:border-emerald-400 hover:bg-emerald-50/70',
+  'border-sky-200/80 hover:border-sky-400 hover:bg-sky-50/70',
+  'border-amber-200/80 hover:border-amber-400 hover:bg-amber-50/70',
+  'border-rose-200/80 hover:border-rose-400 hover:bg-rose-50/70',
+] as const
+
+const accountantWorkflow = [
+  {
+    label: 'الايرادات النقدية',
+    body: 'مراجعة صندوق الإيرادات ورأس المال مع كشف حساب المساهمين وتحرير الحركات.',
+    to: '/cash-revenues',
+  },
+  {
+    label: 'دفتر المصروفات',
+    body: 'تسجيل المدفوعات اليومية ومراجعة القيود المالية المباشرة في شاشة واحدة.',
+    to: '/expenses',
+  },
+  {
+    label: 'تقرير الرواتب',
+    body: 'مراجعة الاستحقاق والمدفوع والمتبقي لكل موظف حسب الشهر.',
+    to: '/payroll-report',
+  },
+  {
+    label: 'ملفات الموظفين',
+    body: 'متابعة السلف والمكافآت والغيابات وتسوية الرواتب دون إدارة الحسابات الحساسة.',
+    to: '/employees',
+  },
+] as const
+
 export function HomePage() {
+  const { session } = useEmployeeSession()
+  const { viewerSettings, permissions } = useSystemSettings()
+  const currentRole = session?.employee.role
+  const isAccountant = currentRole === 'accountant'
+  const storeName = viewerSettings?.storeName || 'Super M2'
+  const actionCards = [
+    hasPermission(permissions, 'dashboard') ? { label: 'لوحة التشغيل', body: 'مؤشرات المبيعات والتنبيهات والتشغيل اليومي.', to: '/dashboard' } : null,
+    hasPermission(permissions, 'inventory') ? { label: 'لوحة المخزون', body: 'الأصناف والحركات والتنبيهات والرصيد الحالي.', to: '/inventory' } : null,
+    hasPermission(permissions, 'batches') ? { label: 'شاشة الدفعات', body: 'مراقبة الصلاحيات والدفعات والتالف المتوقع.', to: '/batches' } : null,
+    hasPermission(permissions, 'purchases') ? { label: 'شاشة المشتريات', body: 'استلام الموردين وتحديث التكلفة والأرصدة.', to: '/purchases' } : null,
+    hasPermission(permissions, 'expenses') ? { label: 'الايرادات النقدية', body: 'صندوق الإيرادات ورأس المال وكشف حساب المساهمين في شاشة مستقلة.', to: '/cash-revenues' } : null,
+    hasPermission(permissions, 'expenses') ? { label: 'المصروفات', body: 'تسجيل الرواتب والخدمات والمصروفات التشغيلية في سجل موحد.', to: '/expenses' } : null,
+    hasPermission(permissions, 'payroll') ? { label: 'تقرير الرواتب', body: 'عرض مجمع للرواتب والسلف والمكافآت حسب الموظف والفترة.', to: '/payroll-report' } : null,
+    hasPermission(permissions, 'sales') ? { label: 'سجل الفواتير', body: 'متابعة فواتير البيع والمزامنة والمرتجعات.', to: '/invoices' } : null,
+    hasPermission(permissions, 'customers') ? { label: 'حسابات العملاء', body: 'الأرصدة والتسديدات والبيع الآجل.', to: '/customers' } : null,
+    { label: 'شاشة السعارات', body: 'واجهة مستقلة للعميل لفحص السعر فقط.', to: '/price-checker' },
+    hasPermission(permissions, 'employees') ? { label: 'إدارة الموظفين', body: 'ملفات الموظفين والرواتب والقيود الشهرية، مع إدارة الحسابات الحساسة للمدير فقط.', to: '/employees' } : null,
+    hasPermission(permissions, 'system-settings') ? { label: 'إعدادات النظام', body: 'اسم المتجر، وسائل التواصل، الخصومات، وصلاحيات الأدوار من شاشة مركزية واحدة.', to: '/settings' } : null,
+  ].filter((entry): entry is { label: string; body: string; to: string } => entry !== null)
+
   return (
     <main className="relative isolate overflow-hidden pb-16 text-stone-900">
       <div className="absolute inset-x-0 top-[-12rem] -z-10 h-[34rem] bg-[radial-gradient(circle_at_top,_rgba(13,148,136,0.22),_transparent_52%),radial-gradient(circle_at_right,_rgba(249,115,22,0.20),_transparent_32%)]" />
@@ -86,7 +140,7 @@ export function HomePage() {
               </div>
               <div>
                 <p className="font-display text-lg font-extrabold tracking-tight text-stone-900">
-                  Super M2
+                  {storeName}
                 </p>
                 <p className="text-sm text-stone-600">
                   منصة تشغيل السوبر ماركت والبقالة بنقطة بيع ومخزون ومحاسبة في واجهة واحدة.
@@ -110,13 +164,12 @@ export function HomePage() {
             </nav>
           </div>
         </header>
-
         <section id="hero" className="mt-6 grid gap-6 lg:grid-cols-[1.12fr_0.88fr] lg:items-stretch">
           <div className="rounded-[34px] border border-white/70 bg-[linear-gradient(135deg,rgba(255,255,255,0.88),rgba(245,239,226,0.92))] p-7 shadow-[0_28px_90px_rgba(77,60,27,0.12)] backdrop-blur-xl sm:p-9">
             <div className="mb-6 inline-flex items-center gap-2 rounded-full border border-teal-200 bg-teal-50 px-4 py-2 text-sm font-bold text-teal-800">
-              المرحلة الحالية
+              {isAccountant ? 'مسار المحاسب' : 'المرحلة الحالية'}
               <span className="h-2 w-2 rounded-full bg-teal-500" />
-              انطلاق الهيكل التنفيذي للنظام
+              {isAccountant ? 'الوصول السريع إلى الرواتب والمصروفات' : 'انطلاق الهيكل التنفيذي للنظام'}
             </div>
 
             <h1 className="font-display text-4xl font-black leading-[1.15] tracking-tight text-stone-950 sm:text-5xl lg:text-6xl">
@@ -129,46 +182,75 @@ export function HomePage() {
             <p className="mt-5 max-w-2xl text-base leading-8 text-stone-700 sm:text-lg">
               الواجهة الحالية أصبحت مدخلاً فعلياً للنظام، والمرحلة التالية جاهزة الآن عبر
               شاشة POS تفاعلية، مع مخطط قاعدة بيانات وهيكل مشروع يدعم التوسع إلى فروع
-              متعددة والعمل دون اتصال، مع اعتماد الدينار العراقي والدولار الأمريكي داخل
-              البرنامج.
+              متعددة والعمل دون اتصال، مع اعتماد نموذج إدارة مركزي ونقاط بيع مرتبطة عبر
+              الشبكة، ومع اعتماد الدينار العراقي والدولار الأمريكي داخل البرنامج.
             </p>
 
-            <div className="mt-8 flex flex-col gap-3 sm:flex-row">
-              <Link
-                className="inline-flex items-center justify-center rounded-2xl bg-teal-700 px-6 py-3 text-base font-bold text-white transition hover:bg-teal-600"
-                to="/dashboard"
-              >
-                فتح لوحة التشغيل
-              </Link>
+            {isAccountant ? (
+              <div className="mt-6 rounded-[28px] border border-emerald-200 bg-[linear-gradient(135deg,rgba(16,185,129,0.10),rgba(255,255,255,0.92))] p-5 shadow-[0_12px_40px_rgba(16,185,129,0.10)]">
+                <p className="text-sm font-black tracking-[0.2em] text-emerald-700">ACCOUNTING DESK</p>
+                <h2 className="mt-2 font-display text-3xl font-black text-stone-950">مركز العمل المالي اليومي</h2>
+                <p className="mt-3 max-w-2xl text-sm leading-7 text-stone-700">
+                  هذا المسار يجمع المصروفات، الرواتب، والسجل المالي للموظفين في واجهة واحدة، مع إبقاء إدارة الحسابات وتغيير الصلاحيات بيد المدير فقط.
+                </p>
+                <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                  {accountantWorkflow.map((entry) => (
+                    <Link
+                      key={entry.to}
+                      className="rounded-[22px] border border-emerald-200/80 bg-white/90 p-4 transition hover:-translate-y-1 hover:border-emerald-400 hover:bg-emerald-50/70"
+                      to={entry.to}
+                    >
+                      <p className="text-xs font-black tracking-[0.18em] text-emerald-700">FOCUS</p>
+                      <h3 className="mt-2 font-display text-xl font-black text-stone-950">{entry.label}</h3>
+                      <p className="mt-2 text-sm leading-7 text-stone-600">{entry.body}</p>
+                    </Link>
+                  ))}
+                </div>
+              </div>
+            ) : null}
+
+            <div className="mt-8 flex flex-col gap-3 sm:flex-row sm:flex-wrap">
+              {isAccountant ? (
+                <>
+                  <Link
+                    className="inline-flex items-center justify-center rounded-2xl bg-emerald-700 px-6 py-3 text-base font-bold text-white transition hover:bg-emerald-600"
+                    to="/cash-revenues"
+                  >
+                    فتح الايرادات النقدية
+                  </Link>
+                  <Link
+                    className="inline-flex items-center justify-center rounded-2xl bg-emerald-700 px-6 py-3 text-base font-bold text-white transition hover:bg-emerald-600"
+                    to="/expenses"
+                  >
+                    فتح دفتر المصروفات
+                  </Link>
+                  <Link
+                    className="inline-flex items-center justify-center rounded-2xl border border-stone-300 bg-white/80 px-6 py-3 text-base font-bold text-stone-800 transition hover:border-rose-500 hover:text-rose-700"
+                    to="/payroll-report"
+                  >
+                    متابعة تقرير الرواتب
+                  </Link>
+                </>
+              ) : null}
+              {hasPermission(permissions, 'dashboard') ? (
+                <Link
+                  className="inline-flex items-center justify-center rounded-2xl bg-teal-700 px-6 py-3 text-base font-bold text-white transition hover:bg-teal-600"
+                  to="/dashboard"
+                >
+                  فتح لوحة التشغيل
+                </Link>
+              ) : null}
               <Link
                 className="inline-flex items-center justify-center rounded-2xl bg-stone-950 px-6 py-3 text-base font-bold text-white transition hover:bg-stone-800"
-                to="/pos"
+                to="/login"
               >
-                فتح شاشة الكاشير
+                دخول الكاشير
               </Link>
               <Link
-                className="inline-flex items-center justify-center rounded-2xl border border-stone-300 bg-white/80 px-6 py-3 text-base font-bold text-stone-800 transition hover:border-teal-500 hover:text-teal-700"
-                to="/inventory"
+                className="inline-flex items-center justify-center rounded-2xl border border-stone-300 bg-white/80 px-6 py-3 text-base font-bold text-stone-800 transition hover:border-sky-500 hover:text-sky-700"
+                to="/price-checker"
               >
-                فتح لوحة المخزون
-              </Link>
-              <Link
-                className="inline-flex items-center justify-center rounded-2xl border border-stone-300 bg-white/80 px-6 py-3 text-base font-bold text-stone-800 transition hover:border-emerald-500 hover:text-emerald-700"
-                to="/purchases"
-              >
-                فتح شاشة المشتريات
-              </Link>
-              <Link
-                className="inline-flex items-center justify-center rounded-2xl border border-stone-300 bg-white/80 px-6 py-3 text-base font-bold text-stone-800 transition hover:border-teal-500 hover:text-teal-700"
-                to="/invoices"
-              >
-                فتح سجل الفواتير
-              </Link>
-              <Link
-                className="inline-flex items-center justify-center rounded-2xl border border-stone-300 bg-white/80 px-6 py-3 text-base font-bold text-stone-800 transition hover:border-emerald-500 hover:text-emerald-700"
-                to="/customers"
-              >
-                فتح حسابات العملاء
+                فتح شاشة السعارات
               </Link>
               <a
                 className="inline-flex items-center justify-center rounded-2xl border border-stone-300 bg-white/80 px-6 py-3 text-base font-bold text-stone-800 transition hover:border-amber-500 hover:text-amber-700"
@@ -176,6 +258,20 @@ export function HomePage() {
               >
                 استكشاف الموديولات الأساسية
               </a>
+            </div>
+
+            <div className="mt-8 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+              {actionCards.map((card, index) => (
+                <Link
+                  key={card.to}
+                  className={`rounded-[24px] border bg-white/86 p-4 shadow-[0_12px_40px_rgba(120,98,61,0.08)] transition hover:-translate-y-1 ${actionCardStyles[index % actionCardStyles.length]}`}
+                  to={card.to}
+                >
+                  <p className="text-sm font-black tracking-[0.18em] text-stone-500">QUICK ACCESS</p>
+                  <h3 className="mt-3 font-display text-2xl font-black text-stone-950">{card.label}</h3>
+                  <p className="mt-2 text-sm leading-7 text-stone-600">{card.body}</p>
+                </Link>
+              ))}
             </div>
 
             <div className="mt-8 grid gap-4 sm:grid-cols-3">
@@ -295,7 +391,7 @@ export function HomePage() {
                 <ul className="mt-4 space-y-3 text-sm leading-7 text-white/90">
                   <li>دعم باركود الميزان لاستخراج الوزن والسعر مباشرة.</li>
                   <li>العمل دون اتصال مع سجل محلي ومزامنة تلقائية.</li>
-                  <li>FIFO للدفعات والصلاحية والتنبيهات قبل التلف.</li>
+                  <li>FEFO للدفعات والصلاحية والتنبيهات قبل التلف.</li>
                   <li>صلاحيات تفصيلية تمنع الوصول غير المصرح للأرباح أو التكاليف.</li>
                 </ul>
               </article>
@@ -308,20 +404,20 @@ export function HomePage() {
                     <p className="mt-1 font-display text-2xl font-black">IQD + USD</p>
                   </div>
                   <div className="rounded-2xl bg-black/20 px-4 py-3">
-                    <p className="text-xs text-stone-400">شاشة POS أولية</p>
-                    <p className="mt-1 font-bold text-white">جاهزة للتشغيل الآن</p>
+                    <p className="text-xs text-stone-400">شاشة POS</p>
+                    <p className="mt-1 font-bold text-white">جاهزة للتشغيل والورديات</p>
                   </div>
                   <div className="rounded-2xl bg-black/20 px-4 py-3">
                     <p className="text-xs text-stone-400">سجل الفواتير</p>
-                    <p className="mt-1 font-bold text-emerald-300">واجهة متابعة ومزامنة جاهزة</p>
+                    <p className="mt-1 font-bold text-emerald-300">متابعة ومزامنة ومرتجعات</p>
                   </div>
                   <div className="rounded-2xl bg-black/20 px-4 py-3">
-                    <p className="text-xs text-stone-400">لوحة المخزون</p>
-                    <p className="mt-1 font-bold text-teal-200">تعديل رصيد وحركات مباشرة</p>
+                    <p className="text-xs text-stone-400">الورديات</p>
+                    <p className="mt-1 font-bold text-teal-200">فتح وإغلاق ومحضر تسليم</p>
                   </div>
                   <div className="rounded-2xl bg-black/20 px-4 py-3">
                     <p className="text-xs text-stone-400">هيكل البيانات</p>
-                    <p className="mt-1 font-bold text-amber-300">سيضاف ضمن docs والـ backend scaffold</p>
+                    <p className="mt-1 font-bold text-amber-300">جاهز للتوسع إلى بيئة إنتاجية</p>
                   </div>
                 </div>
               </article>

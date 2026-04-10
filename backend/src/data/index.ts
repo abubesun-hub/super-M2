@@ -2,7 +2,7 @@ import { env } from '../config/env.js'
 import type { DataAccess, StorageInfo } from './contracts.js'
 import { createMemoryDataAccess } from './memory-repositories.js'
 import { initializePostgresPool } from './postgres.js'
-import { createPostgresDataAccess } from './postgres-repositories.js'
+import { createPostgresDataAccess, ensureDefaultAdminAccount } from './postgres-repositories.js'
 
 const memoryDataAccess = createMemoryDataAccess()
 
@@ -47,6 +47,7 @@ export async function initializeDataAccess() {
         return
       }
 
+      await ensureDefaultAdminAccount(pool)
       activeDataAccess = createPostgresDataAccess(pool)
       storageInfo = {
         driver: 'postgres',

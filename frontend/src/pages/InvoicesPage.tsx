@@ -1,13 +1,16 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
-import { formatMoney, formatDualMoney } from '../lib/currency'
+import { FeedbackMessage } from '../components/FeedbackMessage'
+import { formatMoney, formatDualMoney, roundCurrency } from '../lib/currency'
 import { exportRowsToCsv } from '../lib/export'
+import { getUserFacingErrorMessage } from '../lib/user-facing-errors'
 import {
   fetchSaleInvoices,
   readPendingInvoices,
   submitSaleReturn,
   syncPendingInvoices,
   type PendingSaleInvoice,
+  type SaleReturnSettlementType,
   type StoredSaleInvoiceItem,
   type StoredSaleInvoice,
 } from '../lib/sales-api'
@@ -23,6 +26,10 @@ type InvoiceRecord = {
   invoiceNo: string
   createdAt: string
   paymentType: StoredSaleInvoice['paymentType']
+  employeeId: string
+  employeeName: string
+  shiftId: string
+  terminalName: string
   customerId?: string
   customerName?: string
   totalAmount: number
@@ -55,6 +62,10 @@ function mapSavedInvoice(invoice: StoredSaleInvoice): InvoiceRecord {
     invoiceNo: invoice.invoiceNo,
     createdAt: invoice.createdAt,
     paymentType: invoice.paymentType,
+    employeeId: invoice.employeeId,
+    employeeName: invoice.employeeName,
+    shiftId: invoice.shiftId,
+    terminalName: invoice.terminalName,
     customerId: invoice.customerId,
     customerName: invoice.customerName,
     totalAmount: invoice.totalAmount,
@@ -86,6 +97,10 @@ function mapPendingInvoice(invoice: PendingSaleInvoice, index: number): InvoiceR
     invoiceNo: `PENDING-${String(index + 1).padStart(3, '0')}`,
     createdAt: invoice.queuedAt,
     paymentType: invoice.payload.paymentType,
+    employeeId: invoice.payload.employeeId,
+    employeeName: invoice.payload.employeeName,
+    shiftId: invoice.payload.shiftId,
+    terminalName: invoice.payload.terminalName,
     customerId: invoice.payload.customerId,
     customerName: invoice.payload.customerName,
     totalAmount: invoice.payload.totalAmount,
@@ -96,7 +111,7 @@ function mapPendingInvoice(invoice: PendingSaleInvoice, index: number): InvoiceR
     itemsCount: invoice.payload.items.length,
     paymentCount: invoice.payload.payments.length,
     sourceLabel: 'محلي',
-    statusLabel: invoice.payload.paymentType === 'cash' ? 'معلقة للمزامنة - نقدي' : invoice.payload.paymentType === 'partial' ? 'معلقة للمزامنة - جزئي' : 'معلقة للمزامنة - آجل',
+    statusLabel: invoice.payload.paymentType === 'cash' ? 'معلقة للمزامنة - نقدي' : 'معلقة للمزامنة - آجل',
     tone: 'pending',
     subtotal: invoice.payload.subtotal,
     vatAmount: invoice.payload.vatAmount,
@@ -144,9 +159,92 @@ function getReturnableInvoiceItems(invoice: InvoiceRecord) {
     .filter((entry) => entry.remainingQuantity > 0)
 }
 
+function getReturnedItemQuantity(item: InvoiceRecordItem, saleReturn: InvoiceRecord['returns'][number]) {
+  return saleReturn.items.reduce((sum, returnItem) => {
+    if (returnItem.invoiceItemId && returnItem.invoiceItemId === item.id) {
+      return sum + returnItem.quantity
+    }
+
+    if (!returnItem.invoiceItemId && returnItem.productId === item.productId) {
+      return sum + returnItem.quantity
+    }
+
+    return sum
+  }, 0)
+}
+
+function calculateReturnedItemLineTotal(item: InvoiceRecordItem, returnedQuantity: number) {
+  if (item.quantity <= 0 || returnedQuantity <= 0) {
+    return 0
+  }
+
+  return roundCurrency((item.lineTotal / item.quantity) * returnedQuantity)
+}
+
+function getInvoiceFinancialSummary(invoice: InvoiceRecord) {
+  const returnedTotal = roundCurrency(invoice.returns.reduce((sum, saleReturn) => sum + saleReturn.returnValueIqd, 0))
+
+  const returnedSubtotal = roundCurrency(invoice.items.reduce((sum, item) => {
+    const itemReturnedTotal = roundCurrency(invoice.returns.reduce((returnSum, saleReturn) => {
+      const returnedQuantity = getReturnedItemQuantity(item, saleReturn)
+      return returnSum + calculateReturnedItemLineTotal(item, returnedQuantity)
+    }, 0))
+
+    if (itemReturnedTotal <= 0) {
+      return sum
+    }
+
+    return sum + roundCurrency(itemReturnedTotal / (1 + item.vatRate))
+  }, 0))
+
+  const returnedVat = roundCurrency(returnedTotal - returnedSubtotal)
+  const returnedCost = roundCurrency(invoice.items.reduce((sum, item) => {
+    if (!isStoredInvoiceItem(item) || item.quantity <= 0) {
+      return sum
+    }
+
+    const returnedQuantity = invoice.returns.reduce((returnSum, saleReturn) => returnSum + getReturnedItemQuantity(item, saleReturn), 0)
+    if (returnedQuantity <= 0) {
+      return sum
+    }
+
+    return sum + roundCurrency((item.lineCost / item.quantity) * returnedQuantity)
+  }, 0))
+
+  const returnedProfit = roundCurrency(invoice.items.reduce((sum, item) => {
+    if (!isStoredInvoiceItem(item) || item.quantity <= 0) {
+      return sum
+    }
+
+    const returnedQuantity = invoice.returns.reduce((returnSum, saleReturn) => returnSum + getReturnedItemQuantity(item, saleReturn), 0)
+    if (returnedQuantity <= 0) {
+      return sum
+    }
+
+    return sum + roundCurrency((item.lineProfit / item.quantity) * returnedQuantity)
+  }, 0))
+
+  return {
+    returnedTotal,
+    returnedSubtotal,
+    returnedVat,
+    returnedCost,
+    returnedProfit,
+    netTotal: roundCurrency(Math.max(0, invoice.totalAmount - returnedTotal)),
+    netSubtotal: roundCurrency(Math.max(0, invoice.subtotal - returnedSubtotal)),
+    netVat: roundCurrency(Math.max(0, invoice.vatAmount - returnedVat)),
+    netCost: roundCurrency(Math.max(0, invoice.estimatedCost - returnedCost)),
+    netProfit: roundCurrency(Math.max(0, invoice.estimatedProfit - returnedProfit)),
+  }
+}
+
 function normalizeReturnReason(input: string, fallbackReason: string) {
   const trimmed = input.trim()
   return trimmed.length >= 3 ? trimmed : fallbackReason
+}
+
+function getReturnSettlementTypeLabel(settlementType: SaleReturnSettlementType) {
+  return settlementType === 'cash-refund' ? 'رد نقدي' : 'تخفيض مديونية العميل'
 }
 
 function formatDate(value: string) {
@@ -199,6 +297,7 @@ export function InvoicesPage() {
   const [message, setMessage] = useState<string | null>(null)
   const [selectedInvoiceId, setSelectedInvoiceId] = useState<string | null>(null)
   const [returnReason, setReturnReason] = useState('')
+  const [returnSettlementType, setReturnSettlementType] = useState<SaleReturnSettlementType>('cash-refund')
   const [returnQuantities, setReturnQuantities] = useState<Record<string, string>>({})
   const [isSubmittingReturn, setIsSubmittingReturn] = useState(false)
 
@@ -212,7 +311,7 @@ export function InvoicesPage() {
       setMessage(null)
     } catch (error) {
       setPendingInvoices(readPendingInvoices())
-      setMessage(error instanceof Error ? error.message : 'تعذر تحميل السجل حالياً.')
+      setMessage(getUserFacingErrorMessage(error, 'تعذر تحميل السجل حالياً.'))
     } finally {
       setIsLoading(false)
     }
@@ -238,9 +337,11 @@ export function InvoicesPage() {
     }
   }
 
+  const pendingRecords = pendingInvoices.map(mapPendingInvoice)
+  const savedRecords = savedInvoices.map(mapSavedInvoice)
   const records = [
-    ...pendingInvoices.map(mapPendingInvoice),
-    ...savedInvoices.map(mapSavedInvoice),
+    ...pendingRecords,
+    ...savedRecords,
   ].sort((left, right) => new Date(right.createdAt).getTime() - new Date(left.createdAt).getTime())
   const filteredRecords = records.filter((invoice) => {
     const normalizedQuery = invoiceQuery.trim()
@@ -270,19 +371,35 @@ export function InvoicesPage() {
     return matchesQuery && matchesSource && matchesReturns
   })
   const selectedInvoice = filteredRecords.find((invoice) => invoice.id === selectedInvoiceId) ?? filteredRecords[0] ?? null
+  const selectedInvoiceFinancialSummary = selectedInvoice ? getInvoiceFinancialSummary(selectedInvoice) : null
 
-  const savedTotalIqd = savedInvoices.reduce((sum, invoice) => sum + invoice.totalAmount, 0)
-  const savedProfitIqd = savedInvoices.reduce(
-    (sum, invoice) => sum + invoice.items.reduce((itemsSum, item) => itemsSum + item.lineProfit, 0),
+  const savedTotalIqd = savedRecords.reduce((sum, invoice) => sum + getInvoiceFinancialSummary(invoice).netTotal, 0)
+  const savedProfitIqd = savedRecords.reduce(
+    (sum, invoice) => sum + getInvoiceFinancialSummary(invoice).netProfit,
     0,
   )
-  const pendingTotalIqd = pendingInvoices.reduce((sum, invoice) => sum + invoice.payload.totalAmount, 0)
+  const pendingTotalIqd = pendingRecords.reduce((sum, invoice) => sum + getInvoiceFinancialSummary(invoice).netTotal, 0)
 
   useEffect(() => {
     if (!selectedInvoice && filteredRecords.length > 0) {
       setSelectedInvoiceId(filteredRecords[0].id)
     }
   }, [filteredRecords, selectedInvoice])
+
+  useEffect(() => {
+    if (!selectedInvoice || selectedInvoice.tone !== 'saved') {
+      return
+    }
+
+    if (selectedInvoice.paymentType === 'cash' || selectedInvoice.remainingAmountIqd <= 0.01) {
+      setReturnSettlementType('cash-refund')
+      return
+    }
+
+    if (selectedInvoice.amountPaidIqd <= 0.01) {
+      setReturnSettlementType('deduct-customer-balance')
+    }
+  }, [selectedInvoice])
 
   function printSelectedInvoice() {
     if (!selectedInvoice) {
@@ -292,21 +409,23 @@ export function InvoicesPage() {
     window.print()
   }
 
-  async function executeReturn(invoice: InvoiceRecord, items: Array<{ invoiceItemId: string; quantity: number }>, reason: string) {
+  async function executeReturn(invoice: InvoiceRecord, items: Array<{ invoiceItemId: string; quantity: number }>, reason: string, settlementType: SaleReturnSettlementType) {
     setIsSubmittingReturn(true)
 
     try {
       await submitSaleReturn({
         invoiceId: invoice.id,
         reason,
+        settlementType,
         items,
       })
       await loadInvoices()
       setReturnReason('')
+      setReturnSettlementType('cash-refund')
       setReturnQuantities({})
-      setMessage('تم تنفيذ مرتجع المبيعات وإعادة الكميات إلى المخزون.')
+      setMessage(settlementType === 'cash-refund' ? 'تم تنفيذ المرتجع مع رد المبلغ نقداً وإعادة الكميات إلى المخزون.' : 'تم تنفيذ المرتجع وتخفيض مديونية العميل مع إعادة الكميات إلى المخزون.')
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'تعذر تنفيذ مرتجع المبيعات.')
+      setMessage(getUserFacingErrorMessage(error, 'تعذر تنفيذ مرتجع المبيعات.'))
     } finally {
       setIsSubmittingReturn(false)
     }
@@ -337,7 +456,7 @@ export function InvoicesPage() {
       return
     }
 
-    await executeReturn(selectedInvoice, items, returnReason.trim())
+    await executeReturn(selectedInvoice, items, returnReason.trim(), returnSettlementType)
   }
 
   async function handleSubmitFullReturn() {
@@ -366,6 +485,7 @@ export function InvoicesPage() {
       selectedInvoice,
       items,
       normalizeReturnReason(returnReason, `إلغاء كامل المتبقي من الفاتورة ${selectedInvoice.invoiceNo}`),
+      returnSettlementType,
     )
   }
 
@@ -393,6 +513,7 @@ export function InvoicesPage() {
       selectedInvoice,
       [{ invoiceItemId: item.id, quantity }],
       normalizeReturnReason(returnReason, `مرتجع للسطر ${getInvoiceItemSaleModeLabel(item)} من الفاتورة ${selectedInvoice.invoiceNo}`),
+      returnSettlementType,
     )
   }
 
@@ -408,27 +529,35 @@ export function InvoicesPage() {
         'exchange_rate',
         'subtotal_iqd',
         'vat_iqd',
-        'total_iqd',
+        'returned_total_iqd',
+        'net_total_iqd',
+        'original_total_iqd',
         'items_count',
         'payments_count',
         'returns_count',
         'notes',
       ],
-      rows: filteredRecords.map((invoice) => [
-        invoice.invoiceNo,
-        invoice.createdAt,
-        invoice.sourceLabel,
-        invoice.statusLabel,
-        invoice.currencyCode,
-        invoice.exchangeRate,
-        invoice.subtotal,
-        invoice.vatAmount,
-        invoice.totalAmount,
-        invoice.itemsCount,
-        invoice.paymentCount,
-        invoice.returns.length,
-        invoice.notes ?? '',
-      ]),
+      rows: filteredRecords.map((invoice) => {
+        const financialSummary = getInvoiceFinancialSummary(invoice)
+
+        return [
+          invoice.invoiceNo,
+          invoice.createdAt,
+          invoice.sourceLabel,
+          invoice.statusLabel,
+          invoice.currencyCode,
+          invoice.exchangeRate,
+          financialSummary.netSubtotal,
+          financialSummary.netVat,
+          financialSummary.returnedTotal,
+          financialSummary.netTotal,
+          invoice.totalAmount,
+          invoice.itemsCount,
+          invoice.paymentCount,
+          invoice.returns.length,
+          invoice.notes ?? '',
+        ]
+      }),
     })
   }
 
@@ -498,11 +627,7 @@ export function InvoicesPage() {
           </article>
         </section>
 
-        {message ? (
-          <section className="mt-6 rounded-[24px] border border-teal-300/40 bg-teal-50 px-5 py-4 text-sm font-bold text-teal-800">
-            {message}
-          </section>
-        ) : null}
+        <FeedbackMessage message={message} onClear={() => setMessage(null)} />
 
         <section className="mt-6 grid gap-6 xl:grid-cols-[0.95fr_1.05fr]">
           <div className="rounded-[32px] border border-white/70 bg-white/82 p-5 shadow-[0_24px_80px_rgba(77,60,27,0.10)] backdrop-blur-xl sm:p-6 print:hidden">
@@ -580,7 +705,9 @@ export function InvoicesPage() {
               </div>
             ) : (
               filteredRecords.map((invoice) => {
-                const totalDisplay = formatDualMoney(invoice.totalAmount, invoice.currencyCode, invoice.exchangeRate)
+                const financialSummary = getInvoiceFinancialSummary(invoice)
+                const totalDisplay = formatDualMoney(financialSummary.netTotal, invoice.currencyCode, invoice.exchangeRate)
+                const originalTotalDisplay = formatDualMoney(invoice.totalAmount, invoice.currencyCode, invoice.exchangeRate)
 
                 return (
                   <button
@@ -603,6 +730,12 @@ export function InvoicesPage() {
                         <p className="mt-2 text-sm text-stone-600">
                           تاريخ العملية: {formatDate(invoice.createdAt)}
                           <span className="mx-2 text-stone-400">|</span>
+                          الكاشير: {invoice.employeeName}
+                          <span className="mx-2 text-stone-400">|</span>
+                          الجهاز: {invoice.terminalName}
+                          <span className="mx-2 text-stone-400">|</span>
+                          الوردية: {invoice.shiftId}
+                          <span className="mx-2 text-stone-400">|</span>
                           عناصر الفاتورة: {invoice.itemsCount}
                           <span className="mx-2 text-stone-400">|</span>
                           دفعات مسجلة: {invoice.paymentCount}
@@ -618,11 +751,16 @@ export function InvoicesPage() {
                       </div>
 
                       <div className="min-w-52 rounded-2xl bg-white px-4 py-4 text-left">
-                        <p className="text-xs text-stone-500">الإجمالي</p>
+                        <p className="text-xs text-stone-500">الصافي النهائي</p>
                         <p className="mt-1 font-display text-2xl font-black text-teal-700">{totalDisplay.primary}</p>
                         <p className="mt-1 text-xs font-bold text-stone-500">{totalDisplay.secondary}</p>
+                        {financialSummary.returnedTotal > 0.01 ? (
+                          <p className="mt-2 text-xs font-bold text-rose-700">
+                            المرتجع: {formatMoney(financialSummary.returnedTotal, 'IQD')} | الأصل: {originalTotalDisplay.primary}
+                          </p>
+                        ) : null}
                         {invoice.remainingAmountIqd > 0.01 ? <p className="mt-2 text-xs font-bold text-amber-700">المتبقي: {formatMoney(invoice.remainingAmountIqd, 'IQD')}</p> : null}
-                        <p className="mt-2 text-xs font-bold text-emerald-700">ربح تقديري: {formatMoney(invoice.estimatedProfit, 'IQD')}</p>
+                        <p className="mt-2 text-xs font-bold text-emerald-700">ربح تقديري: {formatMoney(financialSummary.netProfit, 'IQD')}</p>
                       </div>
                     </div>
                   </button>
@@ -658,6 +796,7 @@ export function InvoicesPage() {
                     <div className="text-left">
                       <p className="font-display text-2xl font-black text-amber-300 print:text-stone-900">{selectedInvoice.invoiceNo}</p>
                       <p className="mt-1 text-sm text-stone-300 print:text-stone-600">{formatDate(selectedInvoice.createdAt)}</p>
+                      <p className="mt-1 text-sm text-stone-300 print:text-stone-600">{selectedInvoice.employeeName} • {selectedInvoice.terminalName}</p>
                     </div>
                   </div>
 
@@ -829,6 +968,38 @@ export function InvoicesPage() {
                           />
                         </label>
 
+                        <div className="rounded-2xl border border-white/10 bg-white/8 px-4 py-4 text-sm text-stone-100">
+                          <p className="font-black text-white">تسوية المرتجع</p>
+                          {selectedInvoice.paymentType === 'cash' || selectedInvoice.remainingAmountIqd <= 0.01 ? (
+                            <p className="mt-2">هذه الفاتورة تُعامل كمرتجع نقدي، وسيتم رد قيمة المرتجع من الصندوق.</p>
+                          ) : (
+                            <div className="mt-3 space-y-3">
+                              <div className="grid gap-2 sm:grid-cols-2">
+                                <button
+                                  className={`rounded-2xl px-4 py-3 text-sm font-black transition ${returnSettlementType === 'deduct-customer-balance' ? 'bg-white text-stone-950' : 'border border-white/15 bg-white/6 text-white'}`}
+                                  onClick={() => setReturnSettlementType('deduct-customer-balance')}
+                                  type="button"
+                                >
+                                  تخفيض مديونية العميل
+                                </button>
+                                <button
+                                  className={`rounded-2xl px-4 py-3 text-sm font-black transition ${returnSettlementType === 'cash-refund' ? 'bg-white text-stone-950' : 'border border-white/15 bg-white/6 text-white'}`}
+                                  onClick={() => setReturnSettlementType('cash-refund')}
+                                  type="button"
+                                  disabled={selectedInvoice.amountPaidIqd <= 0.01}
+                                >
+                                  رد نقدي من الصندوق
+                                </button>
+                              </div>
+                              <p className="text-xs font-bold text-stone-300">
+                                {returnSettlementType === 'deduct-customer-balance'
+                                  ? 'سيتم تخفيض المتبقي على العميل دون إخراج نقد من الصندوق.'
+                                  : 'سيتم رد قيمة المرتجع من الصندوق ما دام هناك مبلغ مدفوع قابل للاسترداد.'}
+                              </p>
+                            </div>
+                          )}
+                        </div>
+
                         <button
                           className="rounded-2xl bg-rose-500 px-4 py-3 text-base font-black text-white transition hover:bg-rose-400 disabled:cursor-not-allowed disabled:bg-rose-300"
                           disabled={isSubmittingReturn}
@@ -845,6 +1016,12 @@ export function InvoicesPage() {
                               <div className="flex items-center justify-between gap-3">
                                 <p className="font-bold text-white">{saleReturn.reason}</p>
                                 <p className="text-xs text-rose-100">{formatDate(saleReturn.createdAt)}</p>
+                              </div>
+                              <div className="mt-2 flex flex-wrap gap-2 text-xs text-rose-50">
+                                <span className="rounded-full bg-white/10 px-3 py-1 font-bold">{getReturnSettlementTypeLabel(saleReturn.settlementType)}</span>
+                                <span className="rounded-full bg-white/10 px-3 py-1 font-bold">قيمة المرتجع: {formatMoney(saleReturn.returnValueIqd, 'IQD')}</span>
+                                {saleReturn.cashRefundIqd > 0.01 ? <span className="rounded-full bg-white/10 px-3 py-1 font-bold">رد نقدي: {formatMoney(saleReturn.cashRefundIqd, 'IQD')}</span> : null}
+                                {saleReturn.debtReliefIqd > 0.01 ? <span className="rounded-full bg-white/10 px-3 py-1 font-bold">تخفيض دين: {formatMoney(saleReturn.debtReliefIqd, 'IQD')}</span> : null}
                               </div>
                               <div className="mt-2 flex flex-wrap gap-2 text-xs text-rose-50">
                                 {saleReturn.items.map((item) => (
@@ -875,25 +1052,49 @@ export function InvoicesPage() {
                     ) : null}
                     <div className="flex items-center justify-between">
                       <span className="text-sm font-bold text-stone-600">الإجمالي قبل الضريبة</span>
-                      <span className="font-display text-xl font-black">{formatMoney(selectedInvoice.subtotal, selectedInvoice.currencyCode, selectedInvoice.exchangeRate)}</span>
+                      <span className="font-display text-xl font-black">{formatMoney(selectedInvoiceFinancialSummary?.netSubtotal ?? selectedInvoice.subtotal, selectedInvoice.currencyCode, selectedInvoice.exchangeRate)}</span>
                     </div>
                     <div className="flex items-center justify-between">
                       <span className="text-sm font-bold text-stone-600">الضريبة</span>
-                      <span className="font-display text-xl font-black text-amber-600">{formatMoney(selectedInvoice.vatAmount, selectedInvoice.currencyCode, selectedInvoice.exchangeRate)}</span>
+                      <span className="font-display text-xl font-black text-amber-600">{formatMoney(selectedInvoiceFinancialSummary?.netVat ?? selectedInvoice.vatAmount, selectedInvoice.currencyCode, selectedInvoice.exchangeRate)}</span>
                     </div>
+                    {(selectedInvoiceFinancialSummary?.returnedTotal ?? 0) > 0.01 ? (
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-bold text-stone-600">إجمالي المرتجع</span>
+                        <span className="font-display text-xl font-black text-rose-700">{formatMoney(selectedInvoiceFinancialSummary?.returnedTotal ?? 0, 'IQD')}</span>
+                      </div>
+                    ) : null}
+                    {(selectedInvoiceFinancialSummary?.returnedTotal ?? 0) > 0.01 ? (
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-bold text-stone-600">الإجمالي الأصلي قبل المرتجع</span>
+                        <span className="font-display text-xl font-black text-stone-700">{formatMoney(selectedInvoice.totalAmount, selectedInvoice.currencyCode, selectedInvoice.exchangeRate)}</span>
+                      </div>
+                    ) : null}
+                    {(selectedInvoiceFinancialSummary?.returnedCost ?? 0) > 0.01 ? (
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-bold text-stone-600">تكلفة السلع المرتجعة</span>
+                        <span className="font-display text-xl font-black text-rose-700">{formatMoney(selectedInvoiceFinancialSummary?.returnedCost ?? 0, 'IQD')}</span>
+                      </div>
+                    ) : null}
+                    {(selectedInvoiceFinancialSummary?.returnedProfit ?? 0) > 0.01 ? (
+                      <div className="flex items-center justify-between">
+                        <span className="text-sm font-bold text-stone-600">الربح الملغى بالمرتجع</span>
+                        <span className="font-display text-xl font-black text-rose-700">{formatMoney(selectedInvoiceFinancialSummary?.returnedProfit ?? 0, 'IQD')}</span>
+                      </div>
+                    ) : null}
                     <div className="flex items-center justify-between">
                       <span className="text-sm font-bold text-stone-600">التكلفة التقديرية</span>
-                      <span className="font-display text-xl font-black text-stone-900">{formatMoney(selectedInvoice.estimatedCost, 'IQD')}</span>
+                      <span className="font-display text-xl font-black text-stone-900">{formatMoney(selectedInvoiceFinancialSummary?.netCost ?? selectedInvoice.estimatedCost, 'IQD')}</span>
                     </div>
                     <div className="flex items-center justify-between">
                       <span className="text-sm font-bold text-stone-600">الربح التقديري</span>
-                      <span className="font-display text-xl font-black text-emerald-700">{formatMoney(selectedInvoice.estimatedProfit, 'IQD')}</span>
+                      <span className="font-display text-xl font-black text-emerald-700">{formatMoney(selectedInvoiceFinancialSummary?.netProfit ?? selectedInvoice.estimatedProfit, 'IQD')}</span>
                     </div>
                     <div className="flex items-center justify-between border-t border-stone-200 pt-3">
-                      <span className="text-sm font-bold text-stone-700">الإجمالي النهائي</span>
+                      <span className="text-sm font-bold text-stone-700">الصافي النهائي بعد المرتجع</span>
                       <div className="text-left">
-                        <p className="font-display text-2xl font-black text-teal-700">{formatMoney(selectedInvoice.totalAmount, selectedInvoice.currencyCode, selectedInvoice.exchangeRate)}</p>
-                        <p className="text-xs font-bold text-stone-500">{formatDualMoney(selectedInvoice.totalAmount, selectedInvoice.currencyCode, selectedInvoice.exchangeRate).secondary}</p>
+                        <p className="font-display text-2xl font-black text-teal-700">{formatMoney(selectedInvoiceFinancialSummary?.netTotal ?? selectedInvoice.totalAmount, selectedInvoice.currencyCode, selectedInvoice.exchangeRate)}</p>
+                        <p className="text-xs font-bold text-stone-500">{formatDualMoney(selectedInvoiceFinancialSummary?.netTotal ?? selectedInvoice.totalAmount, selectedInvoice.currencyCode, selectedInvoice.exchangeRate).secondary}</p>
                       </div>
                     </div>
                   </div>

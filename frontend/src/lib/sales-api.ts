@@ -1,5 +1,7 @@
 import type { CartLine } from './pos'
 import type { CurrencyCode } from './currency'
+import { apiFetch } from './api'
+import { getUserFacingApiErrorMessage } from './user-facing-errors'
 
 const pendingInvoicesStorageKey = 'super-m2-pending-sale-invoices'
 
@@ -11,8 +13,14 @@ export type SaleInvoicePayment = {
   exchangeRate: number
 }
 
+export type SaleReturnSettlementType = 'cash-refund' | 'deduct-customer-balance'
+
 export type CreateSaleInvoicePayload = {
-  paymentType: 'cash' | 'credit' | 'partial'
+  paymentType: 'cash' | 'credit'
+  employeeId: string
+  employeeName: string
+  shiftId: string
+  terminalName: string
   customerId?: string
   customerName?: string
   currencyCode: CurrencyCode
@@ -71,6 +79,10 @@ export type StoredSaleInvoice = Omit<CreateSaleInvoicePayload, 'items'> & {
     id: string
     createdAt: string
     reason: string
+    settlementType: SaleReturnSettlementType
+    returnValueIqd: number
+    cashRefundIqd: number
+    debtReliefIqd: number
     items: Array<{
       invoiceItemId?: string
       productId: string
@@ -87,13 +99,13 @@ function createPendingInvoiceId() {
   return `pending-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
 }
 
-function getApiBaseUrl() {
-  return import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:4000/api'
-}
-
 export function buildSaleInvoicePayload(input: {
   cart: CartLine[]
   paymentType: CreateSaleInvoicePayload['paymentType']
+  employeeId: string
+  employeeName: string
+  shiftId: string
+  terminalName: string
   customerId?: string
   customerName?: string
   currencyCode: CurrencyCode
@@ -105,6 +117,10 @@ export function buildSaleInvoicePayload(input: {
 }) {
   return {
     paymentType: input.paymentType,
+    employeeId: input.employeeId,
+    employeeName: input.employeeName,
+    shiftId: input.shiftId,
+    terminalName: input.terminalName,
     customerId: input.customerId,
     customerName: input.customerName,
     currencyCode: input.currencyCode,
@@ -182,7 +198,7 @@ export function writePendingInvoices(invoices: PendingSaleInvoice[]) {
 }
 
 export async function submitSaleInvoice(payload: CreateSaleInvoicePayload) {
-  const response = await fetch(`${getApiBaseUrl()}/sales/invoices`, {
+  const response = await apiFetch('/sales/invoices', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -192,7 +208,7 @@ export async function submitSaleInvoice(payload: CreateSaleInvoicePayload) {
 
   if (!response.ok) {
     const errorBody = (await response.json().catch(() => null)) as { message?: string } | null
-    throw new Error(errorBody?.message ?? 'تعذر حفظ الفاتورة على الخادم.')
+    throw new Error(getUserFacingApiErrorMessage(errorBody?.message, 'تعذر حفظ الفاتورة على الخادم.'))
   }
 
   const body = (await response.json()) as { data: SaleInvoiceResponse }
@@ -200,7 +216,7 @@ export async function submitSaleInvoice(payload: CreateSaleInvoicePayload) {
 }
 
 export async function fetchSaleInvoices() {
-  const response = await fetch(`${getApiBaseUrl()}/sales/invoices`)
+  const response = await apiFetch('/sales/invoices')
 
   if (!response.ok) {
     throw new Error('تعذر جلب سجل الفواتير من الخادم.')
@@ -213,25 +229,27 @@ export async function fetchSaleInvoices() {
 export async function submitSaleReturn(input: {
   invoiceId: string
   reason: string
+  settlementType: SaleReturnSettlementType
   items: Array<{
     invoiceItemId: string
     quantity: number
   }>
 }) {
-  const response = await fetch(`${getApiBaseUrl()}/sales/invoices/${input.invoiceId}/returns`, {
+  const response = await apiFetch(`/sales/invoices/${input.invoiceId}/returns`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify({
       reason: input.reason,
+      settlementType: input.settlementType,
       items: input.items,
     }),
   })
 
   if (!response.ok) {
     const errorBody = (await response.json().catch(() => null)) as { message?: string } | null
-    throw new Error(errorBody?.message ?? 'تعذر تنفيذ المرتجع على الخادم.')
+    throw new Error(getUserFacingApiErrorMessage(errorBody?.message, 'تعذر تنفيذ المرتجع على الخادم.'))
   }
 
   const body = (await response.json()) as { data: StoredSaleInvoice }

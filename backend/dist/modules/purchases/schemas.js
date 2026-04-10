@@ -1,6 +1,8 @@
 import { z } from 'zod';
 export const purchaseReceiptProductDraftSchema = z.object({
     name: z.string().min(3).max(200),
+    productFamilyName: z.string().min(3).max(200).optional().or(z.literal('')),
+    variantLabel: z.string().max(120).optional().or(z.literal('')),
     barcode: z.string().min(3).max(50),
     wholesaleBarcode: z.string().min(3).max(50).optional().or(z.literal('')),
     plu: z.string().max(10).optional().or(z.literal('')),

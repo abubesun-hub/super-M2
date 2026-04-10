@@ -14,6 +14,7 @@ export type StoredPurchaseReceipt = {
   notes?: string
   createdAt: string
   items: Array<{
+    receiptItemId?: string
     productId: string
     name: string
     quantity: number
@@ -50,7 +51,12 @@ function createId(prefix: string) {
 }
 
 export function listPurchaseReceipts() {
-  return [...storedPurchaseReceipts].reverse()
+  return [...storedPurchaseReceipts]
+    .reverse()
+    .map((receipt) => ({
+      ...receipt,
+      items: receipt.items.map((item) => ({ ...item })),
+    }))
 }
 
 export function createPurchaseReceipt(
@@ -76,4 +82,49 @@ export function createPurchaseReceipt(
 
   storedPurchaseReceipts.push(receipt)
   return receipt
+}
+
+export function findPurchaseReceiptById(receiptId: string) {
+  return storedPurchaseReceipts.find((receipt) => receipt.id === receiptId) ?? null
+}
+
+export function updatePurchaseReceipt(
+  receiptId: string,
+  input: CreatePurchaseReceiptInput,
+  items: StoredPurchaseReceipt['items'],
+  totals: Pick<StoredPurchaseReceipt, 'totalCost' | 'totalCostIqd'>,
+) {
+  const receipt = storedPurchaseReceipts.find((entry) => entry.id === receiptId)
+
+  if (!receipt) {
+    throw new Error('سند الشراء المطلوب غير موجود.')
+  }
+
+  receipt.supplierId = input.supplierId || undefined
+  receipt.supplierName = input.supplierName || undefined
+  receipt.purchaseDate = input.purchaseDate || receipt.purchaseDate
+  receipt.supplierInvoiceNo = input.supplierInvoiceNo || undefined
+  receipt.currencyCode = input.currencyCode
+  receipt.exchangeRate = input.exchangeRate
+  receipt.totalCost = totals.totalCost
+  receipt.totalCostIqd = totals.totalCostIqd
+  receipt.notes = input.notes || undefined
+  receipt.items = items.map((item) => ({ ...item }))
+
+  return receipt
+}
+
+export function deletePurchaseReceipt(receiptId: string) {
+  const receiptIndex = storedPurchaseReceipts.findIndex((receipt) => receipt.id === receiptId)
+
+  if (receiptIndex < 0) {
+    throw new Error('سند الشراء المطلوب غير موجود.')
+  }
+
+  const [receipt] = storedPurchaseReceipts.splice(receiptIndex, 1)
+  return receipt
+}
+
+export function resetPurchasesStore() {
+  storedPurchaseReceipts.splice(0, storedPurchaseReceipts.length)
 }

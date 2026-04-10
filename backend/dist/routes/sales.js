@@ -1,8 +1,11 @@
 import { Router } from 'express';
 import { ZodError } from 'zod';
 import { getDataAccess } from '../data/index.js';
+import { requireEmployeePermission } from '../middleware/employee-auth.js';
 import { createSaleInvoiceSchema, createSaleReturnSchema } from '../modules/sales/schemas.js';
+import { sendOperationError, sendValidationError } from './error-response.js';
 export const salesRouter = Router();
+salesRouter.use(requireEmployeePermission('sales', ['admin', 'cashier']));
 function roundMoney(value) {
     return Number(value.toFixed(2));
 }
@@ -44,7 +47,7 @@ salesRouter.post('/invoices', async (request, response) => {
             });
             return;
         }
-        if ((payload.paymentType === 'credit' || payload.paymentType === 'partial') && paidIqd - payload.totalAmount > 0.01) {
+        if (payload.paymentType === 'credit' && paidIqd - payload.totalAmount > 0.01) {
             response.status(400).json({
                 message: 'الدفعات المدخلة تتجاوز إجمالي الفاتورة.',
             });
@@ -57,15 +60,10 @@ salesRouter.post('/invoices', async (request, response) => {
     }
     catch (error) {
         if (error instanceof ZodError) {
-            response.status(400).json({
-                message: 'بيانات الفاتورة غير صالحة.',
-                issues: error.issues,
-            });
+            sendValidationError(response, 'بيانات الفاتورة غير صالحة.', error.issues);
             return;
         }
-        response.status(400).json({
-            message: error instanceof Error ? error.message : 'حدث خطأ غير متوقع أثناء حفظ الفاتورة.',
-        });
+        sendOperationError(response, error, 'حدث خطأ غير متوقع أثناء حفظ الفاتورة.');
     }
 });
 salesRouter.post('/invoices/:invoiceId/returns', async (request, response) => {
@@ -79,14 +77,9 @@ salesRouter.post('/invoices/:invoiceId/returns', async (request, response) => {
     }
     catch (error) {
         if (error instanceof ZodError) {
-            response.status(400).json({
-                message: 'بيانات المرتجع غير صالحة.',
-                issues: error.issues,
-            });
+            sendValidationError(response, 'بيانات المرتجع غير صالحة.', error.issues);
             return;
         }
-        response.status(error instanceof Error && error.message.includes('غير موجودة') ? 404 : 400).json({
-            message: error instanceof Error ? error.message : 'تعذر تنفيذ مرتجع المبيعات.',
-        });
+        sendOperationError(response, error, 'تعذر تنفيذ مرتجع المبيعات.', error instanceof Error && error.message.includes('غير موجودة') ? 404 : 400);
     }
 });

@@ -1,5 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
+import { FeedbackMessage } from '../components/FeedbackMessage'
+import { useEmployeeSession } from '../lib/auth'
+import { getUserFacingErrorMessage } from '../lib/user-facing-errors'
 import {
   calculateMixedPayment,
   formatDualMoney,
@@ -11,14 +14,20 @@ import {
 import {
   buildSaleInvoicePayload,
   enqueuePendingInvoice,
+  fetchSaleInvoices,
   readPendingInvoices,
   submitSaleInvoice,
   syncPendingInvoices,
+  type StoredSaleInvoice,
 } from '../lib/sales-api'
+import { printShiftHandoverReport, type ShiftDenominationEntry } from '../lib/shift-handover-report'
+import { buildShiftFinancialSummary } from '../lib/shift-summary'
+import { closeShift, fetchShifts, openShift, type CashierShift } from '../lib/shifts-api'
 import { createCustomer, fetchCustomers, type Customer } from '../lib/customers-api'
 import { fetchProducts } from '../lib/products-api'
 import {
   addLineToCart,
+  buildProductDisplayName,
   calculateTotals,
   createCartLine,
   getCartLineMaxSaleQuantity,
@@ -41,9 +50,28 @@ import {
 const cartStorageKey = 'super-m2-pos-cart'
 const currencyStorageKey = 'super-m2-pos-currency'
 const exchangeRateStorageKey = 'super-m2-pos-exchange-rate'
+const terminalNameStorageKey = 'super-m2-pos-terminal-name'
 const scannerHint = 'مثال باركود عادي: 6281000010012 | باركود ميزان: 2400150562574'
 const retailReceiptStoreName = 'Super M2'
-type PosPaymentType = 'cash' | 'credit' | 'partial'
+const cashDenominations = [50000, 25000, 10000, 5000, 1000, 500, 250] as const
+const largeShiftDifferenceThresholdIqd = 25000
+type PosPaymentType = 'cash' | 'credit'
+
+function getProductDisplayParts(product: Pick<Product, 'productFamilyName' | 'variantLabel' | 'name'>) {
+  return {
+    title: product.productFamilyName || product.name,
+    subtitle: product.variantLabel?.trim() || null,
+    displayName: buildProductDisplayName(product.productFamilyName || product.name, product.variantLabel),
+  }
+}
+
+function getCartLineDisplayParts(line: Pick<CartLine, 'productFamilyName' | 'variantLabel' | 'name'>) {
+  return {
+    title: line.productFamilyName || line.name,
+    subtitle: line.variantLabel?.trim() || null,
+    displayName: buildProductDisplayName(line.productFamilyName || line.name, line.variantLabel),
+  }
+}
 
 function readStoredCart() {
   const stored = localStorage.getItem(cartStorageKey)
@@ -81,6 +109,16 @@ function readStoredExchangeRate() {
   return IQD_PER_USD
 }
 
+function readStoredTerminalName() {
+  const stored = localStorage.getItem(terminalNameStorageKey)?.trim()
+
+  if (stored) {
+    return stored
+  }
+
+  return 'POS-1'
+}
+
 function formatQuantity(value: number) {
   return Number.isInteger(value) ? String(value) : value.toFixed(3)
 }
@@ -114,10 +152,6 @@ function buildLocalInvoiceNo() {
 function getPaymentTypeLabel(paymentType: PosPaymentType) {
   if (paymentType === 'credit') {
     return 'بيع آجل'
-  }
-
-  if (paymentType === 'partial') {
-    return 'بيع جزئي'
   }
 
   return 'بيع نقدي'
@@ -269,18 +303,21 @@ function printRetailReceipt(input: {
 }
 
 export function PosPage() {
+  const { session, logout } = useEmployeeSession()
   const [scanInput, setScanInput] = useState('')
+  const scanInputRef = useRef<HTMLInputElement | null>(null)
+  const scannerBufferRef = useRef('')
+  const scannerTimeoutRef = useRef<number | null>(null)
+  const scannerLastKeyAtRef = useRef(0)
   const [cart, setCart] = useState<CartLine[]>(() => readStoredCart())
   const [products, setProducts] = useState<Product[]>(sampleCatalog)
   const [message, setMessage] = useState<string | null>(null)
   const [isOnline, setIsOnline] = useState(() => navigator.onLine)
   const [activeCurrency, setActiveCurrency] = useState<CurrencyCode>(() => readStoredCurrency())
   const [exchangeRate, setExchangeRate] = useState(() => readStoredExchangeRate())
-  const [payments, setPayments] = useState({ IQD: '', USD: '' })
   const [paymentType, setPaymentType] = useState<PosPaymentType>('cash')
   const [customers, setCustomers] = useState<Customer[]>([])
   const [selectedCustomerId, setSelectedCustomerId] = useState('')
-  const [customerNameInput, setCustomerNameInput] = useState('')
   const [isQuickCustomerFormOpen, setIsQuickCustomerFormOpen] = useState(false)
   const [quickCustomerName, setQuickCustomerName] = useState('')
   const [quickCustomerPhone, setQuickCustomerPhone] = useState('')
@@ -290,6 +327,19 @@ export function PosPage() {
   const [isCatalogLoading, setIsCatalogLoading] = useState(true)
   const [isUsingFallbackCatalog, setIsUsingFallbackCatalog] = useState(true)
   const [isCustomersLoading, setIsCustomersLoading] = useState(true)
+  const [shifts, setShifts] = useState<CashierShift[]>([])
+  const [shiftInvoices, setShiftInvoices] = useState<StoredSaleInvoice[]>([])
+  const [isShiftsLoading, setIsShiftsLoading] = useState(true)
+  const [isShiftSubmitting, setIsShiftSubmitting] = useState(false)
+  const [terminalName, setTerminalName] = useState(() => readStoredTerminalName())
+  const [openingFloatInput, setOpeningFloatInput] = useState('0')
+  const [openingNote, setOpeningNote] = useState('')
+  const [closingCashInput, setClosingCashInput] = useState('')
+  const [closingDenominations, setClosingDenominations] = useState<Record<number, string>>({})
+  const [differenceApprovalChecked, setDifferenceApprovalChecked] = useState(false)
+  const [closingNote, setClosingNote] = useState('')
+  const [isShiftExpanded, setIsShiftExpanded] = useState(false)
+  const [isQuickProductsOpen, setIsQuickProductsOpen] = useState(false)
 
   async function loadProducts() {
     setIsCatalogLoading(true)
@@ -319,8 +369,45 @@ export function PosPage() {
     }
   }
 
+  async function loadShifts() {
+    if (!session) {
+      setShifts([])
+      setIsShiftsLoading(false)
+      return
+    }
+
+    setIsShiftsLoading(true)
+
+    try {
+      const [nextShifts, nextInvoices] = await Promise.all([
+        fetchShifts(session.employee.id),
+        fetchSaleInvoices().catch(() => [] as StoredSaleInvoice[]),
+      ])
+      setShifts(nextShifts)
+      setShiftInvoices(nextInvoices)
+    } catch (error) {
+      setMessage(getUserFacingErrorMessage(error, 'تعذر تحميل الورديات.'))
+    } finally {
+      setIsShiftsLoading(false)
+    }
+  }
+
+  async function handleLogoutWithShiftGuard() {
+    if (!currentShift) {
+      logout()
+      return
+    }
+
+    setIsShiftExpanded(true)
+    const closed = await performCloseShift()
+
+    if (closed) {
+      logout()
+    }
+  }
+
   async function handleCreateQuickCustomer() {
-    const normalizedName = quickCustomerName.trim() || customerNameInput.trim()
+    const normalizedName = quickCustomerName.trim()
     const normalizedPhone = quickCustomerPhone.trim()
 
     if (normalizedName.length < 2) {
@@ -346,13 +433,12 @@ export function PosPage() {
         return [createdCustomer, ...nextCustomers]
       })
       setSelectedCustomerId(createdCustomer.id)
-      setCustomerNameInput('')
       setQuickCustomerName('')
       setQuickCustomerPhone('')
       setIsQuickCustomerFormOpen(false)
       setMessage(`تم إنشاء العميل ${createdCustomer.name} وربطه بالفاتورة الحالية.`)
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'تعذر إنشاء العميل من شاشة الكاشير.')
+      setMessage(getUserFacingErrorMessage(error, 'تعذر إنشاء العميل من شاشة الكاشير.'))
     } finally {
       setIsCreatingCustomer(false)
     }
@@ -369,6 +455,10 @@ export function PosPage() {
   useEffect(() => {
     localStorage.setItem(exchangeRateStorageKey, String(exchangeRate))
   }, [exchangeRate])
+
+  useEffect(() => {
+    localStorage.setItem(terminalNameStorageKey, terminalName)
+  }, [terminalName])
 
   useEffect(() => {
     const goOnline = () => setIsOnline(true)
@@ -423,10 +513,146 @@ export function PosPage() {
   }, [])
 
   useEffect(() => {
-    if (paymentType === 'credit') {
-      setPayments({ IQD: '', USD: '' })
+    scanInputRef.current?.focus()
+  }, [])
+
+  useEffect(() => {
+    void loadShifts()
+  }, [session?.employee.id])
+
+  const currentShift = shifts.find((shift) => shift.status === 'open') ?? null
+  const currentShiftSummary = useMemo(
+    () => currentShift
+      ? (currentShift.closingSummary ?? buildShiftFinancialSummary(currentShift.openingFloatIqd, shiftInvoices.filter((invoice) => invoice.shiftId === currentShift.id)))
+      : null,
+    [currentShift, shiftInvoices],
+  )
+  const closingDenominationEntries = useMemo<ShiftDenominationEntry[]>(() => cashDenominations
+    .map((denominationIqd) => ({ denominationIqd, count: Number(closingDenominations[denominationIqd] || '0') || 0 }))
+    .filter((entry) => entry.count > 0), [closingDenominations])
+  const closingDenominationTotal = useMemo(
+    () => closingDenominationEntries.reduce((sum, entry) => sum + (entry.denominationIqd * entry.count), 0),
+    [closingDenominationEntries],
+  )
+  const enteredClosingCashIqd = Number(closingCashInput) || 0
+  const projectedDifferenceIqd = currentShiftSummary ? Number((enteredClosingCashIqd - currentShiftSummary.expectedCashIqd).toFixed(2)) : 0
+  const requiresDifferenceApproval = Math.abs(projectedDifferenceIqd) >= largeShiftDifferenceThresholdIqd
+
+  useEffect(() => {
+    if (!currentShift) {
+      setClosingCashInput('')
+      setClosingDenominations({})
+      setDifferenceApprovalChecked(false)
+      return
     }
-  }, [paymentType])
+
+    setClosingCashInput((currentValue) => currentValue || String(currentShiftSummary?.expectedCashIqd ?? currentShift.openingFloatIqd))
+  }, [currentShift, currentShiftSummary?.expectedCashIqd])
+
+  function handleDenominationCountChange(denominationIqd: number, value: string) {
+    if (value !== '' && (!/^\d+$/.test(value) || Number(value) < 0)) {
+      return
+    }
+
+    setClosingDenominations((current) => ({ ...current, [denominationIqd]: value }))
+  }
+
+  function applyDenominationTotalToClosingCash() {
+    setClosingCashInput(String(closingDenominationTotal))
+  }
+
+  function resetDenominationCounter() {
+    setClosingDenominations({})
+  }
+
+  useEffect(() => {
+    setDifferenceApprovalChecked(false)
+  }, [closingCashInput, closingNote, currentShift?.id])
+
+  async function handleOpenShift() {
+    if (!session) {
+      setMessage('انتهت جلسة الموظف. أعد تسجيل الدخول.')
+      return
+    }
+
+    setIsShiftSubmitting(true)
+
+    try {
+      const shift = await openShift({
+        employeeId: session.employee.id,
+        terminalName,
+        openingFloatIqd: Number(openingFloatInput || '0'),
+        openingNote: openingNote || undefined,
+      })
+      setShifts((current) => [shift, ...current.filter((entry) => entry.id !== shift.id)])
+      setOpeningNote('')
+      setMessage(`تم فتح الوردية ${shift.shiftNo} على جهاز ${shift.terminalName}.`)
+    } catch (error) {
+      setMessage(getUserFacingErrorMessage(error, 'تعذر فتح الوردية.'))
+    } finally {
+      setIsShiftSubmitting(false)
+    }
+  }
+
+  async function performCloseShift(): Promise<boolean> {
+    if (!currentShift) {
+      setMessage('لا توجد وردية مفتوحة لإغلاقها.')
+      return false
+    }
+
+    const closingCashIqd = Number(closingCashInput)
+
+    if (!Number.isFinite(closingCashIqd) || closingCashIqd < 0) {
+      setMessage('أدخل مبلغ التسليم الفعلي بالدينار قبل إغلاق الوردية.')
+      return false
+    }
+
+    if (requiresDifferenceApproval) {
+      if (closingNote.trim().length < 8) {
+        setMessage('فرق الوردية كبير. أضف سبباً واضحاً في ملاحظة الإغلاق قبل المتابعة.')
+        return false
+      }
+
+      if (!differenceApprovalChecked) {
+        setMessage(`فرق الوردية يتجاوز ${formatMoney(largeShiftDifferenceThresholdIqd, 'IQD')}. فعّل تأكيد المراجعة قبل الإغلاق.`)
+        return false
+      }
+    }
+
+    setIsShiftSubmitting(true)
+
+    try {
+      const denominationEntriesSnapshot = closingDenominationEntries
+      const shift = await closeShift({
+        shiftId: currentShift.id,
+        closingCashIqd,
+        closingNote: closingNote || undefined,
+      })
+      const reportPrinted = shift.closingSummary
+        ? printShiftHandoverReport({
+            shift,
+            summary: shift.closingSummary,
+            denominationEntries: denominationEntriesSnapshot,
+          })
+        : false
+      setShifts((current) => current.map((entry) => (entry.id === shift.id ? shift : entry)))
+      setClosingCashInput('')
+      setClosingDenominations({})
+      setDifferenceApprovalChecked(false)
+      setClosingNote('')
+      setMessage(`تم إغلاق الوردية ${shift.shiftNo} بنجاح. الفارق النقدي ${formatMoney(shift.cashDifferenceIqd ?? 0, 'IQD')}.${reportPrinted ? ' تم فتح محضر التسليم للطباعة.' : ' تعذر فتح محضر التسليم للطباعة.'}`)
+      return true
+    } catch (error) {
+      setMessage(getUserFacingErrorMessage(error, 'تعذر إغلاق الوردية.'))
+      return false
+    } finally {
+      setIsShiftSubmitting(false)
+    }
+  }
+
+  async function handleCloseShift() {
+    await performCloseShift()
+  }
 
   const totals = calculateTotals(cart)
   const warnings = getCartWarnings(cart)
@@ -457,10 +683,9 @@ export function PosPage() {
   }
   const paymentInputs = paymentType === 'credit'
     ? { IQD: 0, USD: 0 }
-    : {
-        IQD: Number(payments.IQD) || 0,
-        USD: Number(payments.USD) || 0,
-      }
+    : activeCurrency === 'USD'
+      ? { IQD: 0, USD: Number((totals.total / exchangeRate).toFixed(2)) }
+      : { IQD: totals.total, USD: 0 }
   const paymentSummary = calculateMixedPayment(
     totals.total,
     paymentInputs,
@@ -471,39 +696,35 @@ export function PosPage() {
   const changeDisplay = formatDualMoney(paymentSummary.changeIqd, activeCurrency, exchangeRate)
   const subtotalIqd = Number(subtotalBeforeVat.toFixed(2))
   const selectedCustomer = customers.find((customer) => customer.id === selectedCustomerId) ?? null
-  const manualCustomerName = customerNameInput.trim()
-  const resolvedCustomerName = selectedCustomer?.name ?? (manualCustomerName || undefined)
+  const resolvedCustomerName = selectedCustomer?.name ?? undefined
   const customerBalanceDisplay = selectedCustomer
     ? formatDualMoney(selectedCustomer.currentBalance, activeCurrency, exchangeRate)
     : null
 
-  const paymentEntries = paymentType === 'credit' ? [] : [
-    payments.IQD
-      ? {
-          paymentMethod: 'cash' as const,
-          currencyCode: 'IQD' as const,
-          amountReceived: Number(payments.IQD),
-          amountReceivedIqd: Number(payments.IQD),
-          exchangeRate,
-        }
-      : null,
-    payments.USD
-      ? {
-          paymentMethod: 'cash' as const,
-          currencyCode: 'USD' as const,
-          amountReceived: Number(payments.USD),
-          amountReceivedIqd: Number((Number(payments.USD) * exchangeRate).toFixed(2)),
-          exchangeRate,
-        }
-      : null,
-  ].filter((entry) => entry !== null)
+  const paymentEntries = paymentType === 'credit'
+    ? []
+    : [
+        activeCurrency === 'USD'
+          ? {
+              paymentMethod: 'cash' as const,
+              currencyCode: 'USD' as const,
+              amountReceived: Number((totals.total / exchangeRate).toFixed(2)),
+              amountReceivedIqd: totals.total,
+              exchangeRate,
+            }
+          : {
+              paymentMethod: 'cash' as const,
+              currencyCode: 'IQD' as const,
+              amountReceived: totals.total,
+              amountReceivedIqd: totals.total,
+              exchangeRate,
+            },
+      ]
 
   function resetCheckoutState() {
     setCart([])
-    setPayments({ IQD: '', USD: '' })
     setPaymentType('cash')
     setSelectedCustomerId('')
-    setCustomerNameInput('')
     setQuickCustomerName('')
     setQuickCustomerPhone('')
     setIsQuickCustomerFormOpen(false)
@@ -532,9 +753,10 @@ export function PosPage() {
 
   function addProduct(product: Product, source: CartLine['source'], quantity = 1, saleUnit: SaleUnitMode = 'retail') {
     const nextLine = createCartLine(product, source, quantity, saleUnit)
+    const productDisplay = getProductDisplayParts(product)
     applyCartChange(
       (currentCart) => addLineToCart(currentCart, nextLine),
-      `تمت إضافة ${product.name} بوحدة ${getSaleUnitLabel(product, saleUnit)} إلى السلة.`,
+      `تمت إضافة ${productDisplay.displayName} بوحدة ${getSaleUnitLabel(product, saleUnit)} إلى السلة.`,
     )
   }
 
@@ -545,6 +767,7 @@ export function PosPage() {
     source: CartLine['source'],
     matchedBarcode: string,
   ) {
+    const productDisplay = getProductDisplayParts(product)
     const nextLine = {
       ...createCartLine(product, source, quantity, saleUnit),
       barcode: matchedBarcode,
@@ -552,14 +775,12 @@ export function PosPage() {
 
     applyCartChange(
       (currentCart) => addLineToCart(currentCart, nextLine),
-      `تمت إضافة ${product.name} بوحدة ${getSaleUnitLabel(product, saleUnit)} إلى السلة.`,
+      `تمت إضافة ${productDisplay.displayName} بوحدة ${getSaleUnitLabel(product, saleUnit)} إلى السلة.`,
     )
   }
 
-  function handleScanSubmit(event: React.FormEvent<HTMLFormElement>) {
-    event.preventDefault()
-
-    const scan = scanInput.trim()
+  function processScan(rawScan: string) {
+    const scan = rawScan.trim()
     if (!scan) {
       return
     }
@@ -567,6 +788,8 @@ export function PosPage() {
     const scanMatch = findProductByScan(products, scan)
     if (!scanMatch) {
       setMessage('لم يتم العثور على الصنف. تحقق من الباركود أو سجل الصنف أولاً.')
+      setScanInput(scan)
+      scanInputRef.current?.focus()
       return
     }
 
@@ -577,12 +800,86 @@ export function PosPage() {
       const quantity = parsedScale.totalPrice / product.unitPrice
       addScannedProduct(product, quantity, 'retail', 'scale', matchedBarcode)
       setScanInput('')
+      scanInputRef.current?.focus()
       return
     }
 
     addScannedProduct(product, 1, saleUnit, 'barcode', matchedBarcode)
     setScanInput('')
+    scanInputRef.current?.focus()
   }
+
+  function handleScanSubmit(event: React.FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    processScan(scanInput)
+  }
+
+  useEffect(() => {
+    function clearScannerBuffer() {
+      scannerBufferRef.current = ''
+
+      if (scannerTimeoutRef.current !== null) {
+        window.clearTimeout(scannerTimeoutRef.current)
+        scannerTimeoutRef.current = null
+      }
+    }
+
+    function isEditableTarget(target: EventTarget | null) {
+      if (!(target instanceof HTMLElement)) {
+        return false
+      }
+
+      return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement || target.isContentEditable
+    }
+
+    function handleGlobalScannerKeyDown(event: KeyboardEvent) {
+      if (event.ctrlKey || event.altKey || event.metaKey || isEditableTarget(event.target)) {
+        clearScannerBuffer()
+        return
+      }
+
+      if (event.key === 'Enter') {
+        const bufferedScan = scannerBufferRef.current.trim()
+
+        if (!bufferedScan) {
+          return
+        }
+
+        event.preventDefault()
+        clearScannerBuffer()
+        processScan(bufferedScan)
+        return
+      }
+
+      if (event.key.length !== 1) {
+        return
+      }
+
+      const now = Date.now()
+      if (now - scannerLastKeyAtRef.current > 80) {
+        scannerBufferRef.current = ''
+      }
+
+      scannerLastKeyAtRef.current = now
+      scannerBufferRef.current += event.key
+
+      if (scannerTimeoutRef.current !== null) {
+        window.clearTimeout(scannerTimeoutRef.current)
+      }
+
+      scannerTimeoutRef.current = window.setTimeout(() => {
+        scannerBufferRef.current = ''
+        scannerTimeoutRef.current = null
+      }, 150)
+    }
+
+    window.addEventListener('keydown', handleGlobalScannerKeyDown)
+
+    return () => {
+      window.removeEventListener('keydown', handleGlobalScannerKeyDown)
+      clearScannerBuffer()
+    }
+  }, [products])
 
   function handleQuickAdd(product: Product, saleUnit: SaleUnitMode) {
     addProduct(product, 'manual', saleUnit === 'wholesale' ? 1 : (product.soldByWeight ? 0.5 : 1), saleUnit)
@@ -591,20 +888,6 @@ export function PosPage() {
   function clearCart() {
     resetCheckoutState()
     setMessage('تم تفريغ السلة الحالية.')
-  }
-
-  function handlePaymentAmountChange(currency: CurrencyCode, value: string) {
-    if (value === '') {
-      setPayments((current) => ({ ...current, [currency]: '' }))
-      return
-    }
-
-    const parsed = Number(value)
-    if (!Number.isFinite(parsed) || parsed < 0) {
-      return
-    }
-
-    setPayments((current) => ({ ...current, [currency]: value }))
   }
 
   async function finalizeSale() {
@@ -620,39 +903,29 @@ export function PosPage() {
       return
     }
 
-    if (paymentType === 'cash') {
-      if (!paymentSummary.isSettled) {
-        setMessage(`المبلغ المدخل غير كافٍ. المتبقي ${formatMoney(paymentSummary.dueIqd, 'IQD', exchangeRate)}.`)
-        return
-      }
-
-      if (paymentEntries.length === 0) {
-        setMessage('أدخل مبلغاً مقبوضاً بالدينار أو الدولار قبل تثبيت الدفع.')
-        return
-      }
-    }
-
-    if (paymentType !== 'cash' && !selectedCustomerId && !resolvedCustomerName) {
-      setMessage('حدد العميل أو أدخل اسمه قبل تسجيل البيع الآجل أو الجزئي.')
+    if (paymentType === 'credit' && !selectedCustomerId) {
+      setMessage('حدد العميل قبل تسجيل البيع الآجل.')
       return
     }
 
-    if (paymentType === 'partial') {
-      if (paymentEntries.length === 0 || paymentSummary.totalPaidIqd <= 0) {
-        setMessage('البيع الجزئي يحتاج إلى دفعة أولية أكبر من صفر.')
-        return
-      }
+    if (!session) {
+      setMessage('انتهت جلسة الموظف. أعد تسجيل الدخول.')
+      return
+    }
 
-      if (paymentSummary.totalPaidIqd + 0.01 >= totals.total) {
-        setMessage('إذا تم دفع كامل المبلغ فاستخدم نوع الدفع النقدي بدلاً من الجزئي.')
-        return
-      }
+    if (!currentShift) {
+      setMessage('افتح وردية كاشير قبل تثبيت أي عملية بيع.')
+      return
     }
 
     const payload = buildSaleInvoicePayload({
       cart,
       paymentType,
-      customerId: paymentType === 'cash' ? undefined : (selectedCustomerId || undefined),
+      employeeId: session.employee.id,
+      employeeName: session.employee.name,
+      shiftId: currentShift.id,
+      terminalName: currentShift.terminalName,
+      customerId: paymentType === 'cash' ? undefined : selectedCustomerId,
       customerName: paymentType === 'cash' ? undefined : resolvedCustomerName,
       currencyCode: activeCurrency,
       exchangeRate,
@@ -712,7 +985,7 @@ export function PosPage() {
         primaryCurrency: activeCurrency,
         statusLabel: getPaymentStatusLabel(savedInvoice.paymentStatus),
       })
-      await Promise.all([loadProducts(), loadCustomers()])
+      await Promise.all([loadProducts(), loadCustomers(), loadShifts()])
       const changeText = paymentSummary.changeIqd > 0
         ? ` والباقي للعميل ${formatMoney(paymentSummary.changeIqd, 'IQD', exchangeRate)}.`
         : '.'
@@ -727,7 +1000,7 @@ export function PosPage() {
       const pendingCount = enqueuePendingInvoice(payload)
       setPendingInvoicesCount(pendingCount)
       resetCheckoutState()
-      const reason = error instanceof Error ? error.message : 'تعذر الوصول إلى الخادم.'
+      const reason = getUserFacingErrorMessage(error, 'تعذر الوصول إلى الخادم.')
       setMessage(`تعذر الحفظ على الخادم: ${reason} تم حفظ الفاتورة محلياً للمزامنة لاحقاً. المعلق حالياً: ${pendingCount}.`)
     } finally {
       setIsSubmitting(false)
@@ -752,12 +1025,24 @@ export function PosPage() {
             </div>
 
             <div className="flex flex-wrap items-center gap-3">
+              {session ? (
+                <span className="rounded-full bg-sky-100 px-4 py-2 text-sm font-bold text-sky-800">
+                  {session.employee.name} • {session.employee.employeeNo}
+                </span>
+              ) : null}
               <span className={`rounded-full px-4 py-2 text-sm font-bold ${isOnline ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}>
                 {isOnline ? 'متصل: ستتم مزامنة الفواتير فوراً' : 'غير متصل: الحفظ محلي مؤقت'}
               </span>
               <span className="rounded-full bg-stone-900 px-4 py-2 text-sm font-bold text-white">
                 فواتير معلقة: {pendingInvoicesCount}
               </span>
+              <button
+                className="rounded-full border border-stone-300 bg-white/70 px-4 py-2 text-sm font-bold text-stone-800 transition hover:border-teal-500 hover:text-teal-700"
+                onClick={() => setIsShiftExpanded((current) => !current)}
+                type="button"
+              >
+                {currentShift ? (isShiftExpanded ? 'إخفاء تفاصيل الوردية' : 'تفاصيل الوردية الحالية') : 'فتح / إدارة الوردية'}
+              </button>
               <Link className="rounded-full border border-stone-300 px-4 py-2 text-sm font-bold text-stone-700 transition hover:border-teal-500 hover:text-teal-700" to="/invoices">
                 سجل الفواتير
               </Link>
@@ -767,12 +1052,251 @@ export function PosPage() {
               <Link className="rounded-full border border-stone-300 px-4 py-2 text-sm font-bold text-stone-700 transition hover:border-teal-500 hover:text-teal-700" to="/">
                 العودة للرئيسية
               </Link>
+              <button
+                className="rounded-full border border-rose-300 px-4 py-2 text-sm font-bold text-rose-700 transition hover:border-rose-500"
+                onClick={handleLogoutWithShiftGuard}
+                type="button"
+              >
+                تسجيل الخروج
+              </button>
             </div>
           </div>
         </header>
 
         <section className="mt-6 grid gap-6 xl:grid-cols-[1.15fr_0.85fr]">
           <div className="space-y-6">
+            <section className="rounded-[32px] border border-white/70 bg-white/82 p-5 shadow-[0_24px_80px_rgba(77,60,27,0.10)] backdrop-blur-xl sm:p-6">
+              <div className="flex flex-col gap-4 lg:flex-row lg:items-start lg:justify-between">
+                <div>
+                  <p className="text-sm font-black tracking-[0.2em] text-sky-700">SHIFT CONTROL</p>
+                  <h2 className="mt-2 font-display text-3xl font-black text-stone-950">الوردية الحالية</h2>
+                  <p className="mt-2 text-sm text-stone-600">يلزم وجود وردية مفتوحة قبل تسجيل أي فاتورة على هذا الجهاز.</p>
+                </div>
+                <button
+                  className="rounded-full border border-stone-300 px-4 py-2 text-sm font-bold text-stone-700 transition hover:border-stone-500"
+                  onClick={() => void loadShifts()}
+                  type="button"
+                >
+                  تحديث الورديات
+                </button>
+              </div>
+
+              {(!currentShift || isShiftExpanded) && (
+              <div className="mt-5 grid gap-4 lg:grid-cols-[1.1fr_0.9fr]">
+                <div className="rounded-[24px] border border-stone-200 bg-stone-50/90 p-4">
+                  {isShiftsLoading ? (
+                    <div className="text-sm text-stone-500">جارٍ تحميل حالة الوردية...</div>
+                  ) : currentShift ? (
+                    <div className="space-y-2 text-sm text-stone-700">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <span className="rounded-full bg-emerald-100 px-3 py-1 text-xs font-black text-emerald-800">وردية مفتوحة</span>
+                        <span className="rounded-full bg-stone-900 px-3 py-1 text-xs font-black text-white">{currentShift.shiftNo}</span>
+                      </div>
+                      <p><span className="font-black text-stone-900">الموظف:</span> {currentShift.employeeName}</p>
+                      <p><span className="font-black text-stone-900">الجهاز:</span> {currentShift.terminalName}</p>
+                      <p><span className="font-black text-stone-900">عهدة البداية:</span> {formatMoney(currentShift.openingFloatIqd, 'IQD')}</p>
+                      <p><span className="font-black text-stone-900">وقت الفتح:</span> {formatDateTime(currentShift.openedAt)}</p>
+                      {currentShift.openingNote ? <p><span className="font-black text-stone-900">ملاحظة:</span> {currentShift.openingNote}</p> : null}
+                      {currentShiftSummary ? (
+                        <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                          <div className="rounded-2xl bg-white px-3 py-3">
+                            <p className="text-xs font-black text-stone-500">النقد المتوقع</p>
+                            <p className="mt-1 font-display text-xl font-black text-teal-700">{formatMoney(currentShiftSummary.expectedCashIqd, 'IQD')}</p>
+                          </div>
+                          <div className="rounded-2xl bg-white px-3 py-3">
+                            <p className="text-xs font-black text-stone-500">البيع الآجل</p>
+                            <p className="mt-1 font-display text-xl font-black text-amber-700">{formatMoney(currentShiftSummary.creditSalesIqd, 'IQD')}</p>
+                          </div>
+                          <div className="rounded-2xl bg-white px-3 py-3">
+                            <p className="text-xs font-black text-stone-500">المقبوض من الفواتير</p>
+                            <p className="mt-1 font-display text-xl font-black text-emerald-700">{formatMoney(currentShiftSummary.invoiceCollectionsIqd, 'IQD')}</p>
+                          </div>
+                          <div className="rounded-2xl bg-white px-3 py-3">
+                            <p className="text-xs font-black text-stone-500">تسديدات الآجل</p>
+                            <p className="mt-1 font-display text-xl font-black text-cyan-700">{formatMoney(currentShiftSummary.customerPaymentsIqd, 'IQD')}</p>
+                            <p className="mt-1 text-xs text-stone-500">عدد العمليات: {currentShiftSummary.customerPaymentsCount}</p>
+                          </div>
+                          <div className="rounded-2xl bg-white px-3 py-3">
+                            <p className="text-xs font-black text-stone-500">المرتجعات</p>
+                            <p className="mt-1 font-display text-xl font-black text-rose-700">{formatMoney(currentShiftSummary.returnsValueIqd, 'IQD')}</p>
+                            <p className="mt-1 text-xs text-stone-500">عدد العمليات: {currentShiftSummary.returnsCount}</p>
+                          </div>
+                        </div>
+                      ) : null}
+                    </div>
+                  ) : (
+                    <div className="text-sm text-stone-500">لا توجد وردية مفتوحة حالياً لهذا الموظف.</div>
+                  )}
+                </div>
+
+                <div className="space-y-4 rounded-[24px] border border-stone-200 bg-white p-4">
+                  <label className="block text-sm font-bold text-stone-800">
+                    اسم الجهاز
+                    <input
+                      className="mt-2 h-12 w-full rounded-2xl border border-stone-300 bg-white px-4 text-right text-stone-900 outline-none focus:border-teal-500"
+                      value={terminalName}
+                      onChange={(event) => setTerminalName(event.target.value)}
+                    />
+                  </label>
+
+                  {!currentShift ? (
+                    <>
+                      <label className="block text-sm font-bold text-stone-800">
+                        عهدة البداية بالدينار
+                        <input
+                          className="mt-2 h-12 w-full rounded-2xl border border-stone-300 bg-white px-4 text-right text-stone-900 outline-none focus:border-teal-500"
+                          min="0"
+                          step="250"
+                          type="number"
+                          value={openingFloatInput}
+                          onChange={(event) => setOpeningFloatInput(event.target.value)}
+                        />
+                      </label>
+                      <label className="block text-sm font-bold text-stone-800">
+                        ملاحظة افتتاحية
+                        <textarea
+                          className="mt-2 min-h-24 w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 text-right text-stone-900 outline-none focus:border-teal-500"
+                          value={openingNote}
+                          onChange={(event) => setOpeningNote(event.target.value)}
+                        />
+                      </label>
+                      <button
+                        className="rounded-2xl bg-teal-700 px-5 py-3 text-base font-black text-white transition hover:bg-teal-600 disabled:cursor-not-allowed disabled:bg-stone-400"
+                        disabled={isShiftSubmitting || !terminalName.trim()}
+                        onClick={() => void handleOpenShift()}
+                        type="button"
+                      >
+                        {isShiftSubmitting ? 'جارٍ الفتح...' : 'فتح وردية'}
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      <label className="block text-sm font-bold text-stone-800">
+                        مبلغ التسليم الفعلي بالدينار
+                        <input
+                          className="mt-2 h-12 w-full rounded-2xl border border-stone-300 bg-white px-4 text-right text-stone-900 outline-none focus:border-rose-500"
+                          min="0"
+                          step="250"
+                          type="number"
+                          value={closingCashInput}
+                          onChange={(event) => setClosingCashInput(event.target.value)}
+                        />
+                        {currentShiftSummary ? <span className="mt-2 block text-xs text-stone-500">النقد المتوقع لهذه الوردية حالياً: {formatMoney(currentShiftSummary.expectedCashIqd, 'IQD')}</span> : null}
+                      </label>
+                      <div className="rounded-[22px] border border-stone-200 bg-stone-50/80 p-4">
+                        <div className="flex flex-wrap items-center justify-between gap-3">
+                          <div>
+                            <p className="text-sm font-black tracking-[0.18em] text-stone-500">DENOMINATION COUNTER</p>
+                            <p className="mt-1 text-sm text-stone-600">عدّ الفئات النقدية لتجهيز مبلغ التسليم تلقائياً.</p>
+                          </div>
+                          <div className="flex flex-wrap gap-2">
+                            <button
+                              className="rounded-full border border-stone-300 px-3 py-2 text-xs font-black text-stone-700 transition hover:border-teal-500 hover:text-teal-700"
+                              onClick={applyDenominationTotalToClosingCash}
+                              type="button"
+                            >
+                              استخدام المجموع
+                            </button>
+                            <button
+                              className="rounded-full border border-stone-300 px-3 py-2 text-xs font-black text-stone-700 transition hover:border-rose-500 hover:text-rose-700"
+                              onClick={resetDenominationCounter}
+                              type="button"
+                            >
+                              تصفير العداد
+                            </button>
+                          </div>
+                        </div>
+
+                        <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                          {cashDenominations.map((denominationIqd) => (
+                            <label key={denominationIqd} className="block text-sm font-bold text-stone-800">
+                              فئة {denominationIqd.toLocaleString('en-US')} د.ع
+                              <input
+                                className="mt-2 h-11 w-full rounded-2xl border border-stone-300 bg-white px-4 text-right text-stone-900 outline-none focus:border-teal-500"
+                                inputMode="numeric"
+                                value={closingDenominations[denominationIqd] ?? ''}
+                                onChange={(event) => handleDenominationCountChange(denominationIqd, event.target.value)}
+                                placeholder="0"
+                              />
+                            </label>
+                          ))}
+                        </div>
+
+                        <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                          <div className="rounded-2xl bg-white px-4 py-3">
+                            <p className="text-xs font-black text-stone-500">إجمالي الفئات</p>
+                            <p className="mt-1 font-display text-2xl font-black text-teal-700">{formatMoney(closingDenominationTotal, 'IQD')}</p>
+                          </div>
+                          <div className="rounded-2xl bg-white px-4 py-3">
+                            <p className="text-xs font-black text-stone-500">الفارق المتوقع</p>
+                            <p className={`mt-1 font-display text-2xl font-black ${projectedDifferenceIqd >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>{formatMoney(projectedDifferenceIqd, 'IQD')}</p>
+                          </div>
+                        </div>
+                      </div>
+                      {currentShiftSummary ? (
+                        <div className="rounded-[22px] border border-rose-200 bg-rose-50/70 p-4">
+                          <p className="text-sm font-black tracking-[0.18em] text-rose-700">SHIFT HANDOVER PREVIEW</p>
+                          <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                            <div className="rounded-2xl bg-white px-4 py-3">
+                              <p className="text-xs font-black text-stone-500">النقد المتوقع</p>
+                              <p className="mt-1 font-display text-xl font-black text-sky-700">{formatMoney(currentShiftSummary.expectedCashIqd, 'IQD')}</p>
+                            </div>
+                            <div className="rounded-2xl bg-white px-4 py-3">
+                              <p className="text-xs font-black text-stone-500">النقد المُدخل</p>
+                              <p className="mt-1 font-display text-xl font-black text-stone-950">{formatMoney(enteredClosingCashIqd, 'IQD')}</p>
+                            </div>
+                            <div className="rounded-2xl bg-white px-4 py-3">
+                              <p className="text-xs font-black text-stone-500">الفارق</p>
+                              <p className={`mt-1 font-display text-xl font-black ${projectedDifferenceIqd >= 0 ? 'text-emerald-700' : 'text-rose-700'}`}>{formatMoney(projectedDifferenceIqd, 'IQD')}</p>
+                            </div>
+                            <div className="rounded-2xl bg-white px-4 py-3">
+                              <p className="text-xs font-black text-stone-500">البيع الآجل</p>
+                              <p className="mt-1 font-display text-xl font-black text-amber-700">{formatMoney(currentShiftSummary.creditSalesIqd, 'IQD')}</p>
+                            </div>
+                            <div className="rounded-2xl bg-white px-4 py-3">
+                              <p className="text-xs font-black text-stone-500">تسديدات الآجل</p>
+                              <p className="mt-1 font-display text-xl font-black text-cyan-700">{formatMoney(currentShiftSummary.customerPaymentsIqd, 'IQD')}</p>
+                            </div>
+                          </div>
+                          {requiresDifferenceApproval ? (
+                            <div className="mt-4 rounded-2xl border border-rose-300 bg-white px-4 py-4 text-sm text-rose-800">
+                              <p className="font-black">فرق نقدي كبير يحتاج مراجعة واعتماد قبل إغلاق الوردية.</p>
+                              <p className="mt-1">حد المراجعة الحالي: {formatMoney(largeShiftDifferenceThresholdIqd, 'IQD')}.</p>
+                              <label className="mt-3 flex items-start gap-3">
+                                <input
+                                  checked={differenceApprovalChecked}
+                                  className="mt-1 h-4 w-4 rounded border-rose-300 text-rose-700 focus:ring-rose-500"
+                                  onChange={(event) => setDifferenceApprovalChecked(event.target.checked)}
+                                  type="checkbox"
+                                />
+                                <span className="leading-7">أؤكد أن فرق النقد تمت مراجعته وتوثيق سببه في ملاحظة الإغلاق وإبلاغ الإدارة.</span>
+                              </label>
+                            </div>
+                          ) : null}
+                        </div>
+                      ) : null}
+                      <label className="block text-sm font-bold text-stone-800">
+                        ملاحظة الإغلاق
+                        <textarea
+                          className="mt-2 min-h-24 w-full rounded-2xl border border-stone-300 bg-white px-4 py-3 text-right text-stone-900 outline-none focus:border-rose-500"
+                          value={closingNote}
+                          onChange={(event) => setClosingNote(event.target.value)}
+                        />
+                      </label>
+                      <button
+                        className="rounded-2xl bg-rose-700 px-5 py-3 text-base font-black text-white transition hover:bg-rose-600 disabled:cursor-not-allowed disabled:bg-stone-400"
+                        disabled={isShiftSubmitting || !closingCashInput.trim()}
+                        onClick={() => void handleCloseShift()}
+                        type="button"
+                      >
+                        {isShiftSubmitting ? 'جارٍ الإغلاق...' : 'إغلاق الوردية'}
+                      </button>
+                    </>
+                  )}
+                </div>
+              </div>
+              )}
+            </section>
             <section className="rounded-[32px] border border-stone-200/80 bg-[linear-gradient(180deg,#101826_0%,#172436_100%)] p-5 text-white shadow-[0_28px_90px_rgba(17,24,39,0.18)] sm:p-6">
               <div className="flex flex-col gap-5 lg:flex-row lg:items-center lg:justify-between">
                 <div>
@@ -827,6 +1351,8 @@ export function PosPage() {
               <form className="mt-5 grid gap-3 sm:grid-cols-[1fr_auto]" onSubmit={handleScanSubmit}>
                 <input
                   className="h-14 rounded-2xl border border-white/10 bg-black/20 px-4 text-right text-base text-white outline-none ring-0 placeholder:text-stone-400 focus:border-teal-400"
+                  autoFocus
+                  ref={scanInputRef}
                   value={scanInput}
                   onChange={(event) => setScanInput(event.target.value)}
                   placeholder="امسح الباركود أو أدخله يدوياً"
@@ -836,11 +1362,7 @@ export function PosPage() {
                 </button>
               </form>
 
-              {message ? (
-                <div className="mt-4 rounded-2xl border border-teal-400/20 bg-teal-400/10 px-4 py-3 text-sm text-teal-100">
-                  {message}
-                </div>
-              ) : null}
+              <FeedbackMessage message={message} onClear={() => setMessage(null)} successClassName="mt-4 rounded-2xl border border-teal-400/20 bg-teal-400/10 px-4 py-3 text-sm text-teal-100" />
             </section>
 
             <section className="rounded-[32px] border border-white/70 bg-white/82 p-5 shadow-[0_24px_80px_rgba(77,60,27,0.10)] backdrop-blur-xl sm:p-6">
@@ -863,13 +1385,14 @@ export function PosPage() {
                   cart.map((line) => {
                     const stockSummary = getCartLineStockSummary(line)
                     const maxSaleQuantity = getCartLineMaxSaleQuantity(line)
+                    const lineDisplay = getCartLineDisplayParts(line)
 
                     return (
                     <article key={line.lineId} className="rounded-[26px] border border-stone-200/80 bg-stone-50/80 p-4">
                       <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
                         <div>
                           <div className="flex flex-wrap items-center gap-2">
-                            <h3 className="font-display text-xl font-black text-stone-950">{line.name}</h3>
+                            <h3 className="font-display text-xl font-black text-stone-950">{lineDisplay.title}</h3>
                             <span className="rounded-full bg-stone-900 px-3 py-1 text-xs font-black text-white">
                               {line.source === 'scale' ? 'ميزان' : line.source === 'barcode' ? 'باركود' : 'إضافة سريعة'}
                             </span>
@@ -882,17 +1405,16 @@ export function PosPage() {
                               </span>
                             ) : null}
                           </div>
+                          {lineDisplay.subtitle ? (
+                            <p className="mt-2 text-sm font-bold text-stone-700">
+                              الصنف الفرعي: {lineDisplay.subtitle}
+                            </p>
+                          ) : null}
                           <p className="mt-2 text-sm text-stone-600">
                             سعر الوحدة: {formatMoney(line.unitPrice, activeCurrency, exchangeRate)}
-                            <span className="mx-2 text-stone-400">|</span>
-                            ما يعادله: {formatMoney(line.unitPrice, activeCurrency === 'IQD' ? 'USD' : 'IQD', exchangeRate)}
-                            <span className="mx-2 text-stone-400">|</span>
-                            وحدة البيع الحالية: {line.unitLabel}
+                            <span className="mx-2 text-stone-300">•</span>
+                            الرصيد المتاح: {stockSummary}
                           </p>
-                          <p className="mt-1 text-xs font-bold text-stone-500">الرصيد المتبقي لهذه المادة: {stockSummary}</p>
-                          {line.saleUnit === 'wholesale' && line.wholesaleQuantity ? (
-                            <p className="mt-1 text-xs font-bold text-stone-500">الكمية الأساسية لهذا السطر: {formatQuantity(line.baseQuantity)} {line.retailUnit}</p>
-                          ) : null}
                         </div>
 
                         <div className="flex flex-wrap items-center gap-3">
@@ -978,14 +1500,13 @@ export function PosPage() {
                     <h3 className="mt-1 font-display text-2xl font-black text-stone-950">طريقة الدفع والتحصيل</h3>
                   </div>
                   <span className="rounded-full bg-white px-3 py-2 text-xs font-black text-stone-600">
-                    {paymentType === 'cash' ? 'يمكن إدخال دينار ودولار في نفس الفاتورة' : 'اربط الفاتورة بعميل عند البيع الآجل أو الجزئي'}
+                    {paymentType === 'cash' ? 'البيع النقدي يتم مباشرة بدون إدخال مبالغ قبض.' : 'اربط الفاتورة بعميل محفوظ أو أنشئ عميلاً سريعاً.'}
                   </span>
                 </div>
 
-                <div className="mt-4 grid gap-2 sm:grid-cols-3">
+                <div className="mt-4 grid gap-2 sm:grid-cols-2">
                   {([
                     ['cash', 'نقدي'],
-                    ['partial', 'جزئي'],
                     ['credit', 'آجل'],
                   ] as const).map(([type, label]) => (
                     <button
@@ -1007,12 +1528,7 @@ export function PosPage() {
                         <select
                           className="mt-2 h-12 w-full rounded-2xl border border-stone-300 bg-white px-4 text-right text-base font-bold text-stone-900 outline-none focus:border-emerald-500"
                           value={selectedCustomerId}
-                          onChange={(event) => {
-                            setSelectedCustomerId(event.target.value)
-                            if (event.target.value) {
-                              setCustomerNameInput('')
-                            }
-                          }}
+                          onChange={(event) => setSelectedCustomerId(event.target.value)}
                         >
                           <option value="">{isCustomersLoading ? 'جارٍ تحميل العملاء...' : 'بدون اختيار عميل محفوظ'}</option>
                           {customers.map((customer) => (
@@ -1021,27 +1537,16 @@ export function PosPage() {
                         </select>
                       </label>
 
-                      <label className="text-sm font-bold text-stone-700">
-                        أو اكتب اسم العميل مباشرة
-                        <input
-                          className="mt-2 h-12 w-full rounded-2xl border border-stone-300 bg-white px-4 text-right text-base font-bold text-stone-900 outline-none focus:border-emerald-500"
-                          placeholder="اسم العميل للحساب الآجل"
-                          value={customerNameInput}
-                          onChange={(event) => {
-                            setCustomerNameInput(event.target.value)
-                            if (event.target.value.trim()) {
-                              setSelectedCustomerId('')
-                            }
-                          }}
-                        />
-                      </label>
+                      <div className="rounded-2xl border border-dashed border-emerald-300 bg-white/70 px-4 py-4 text-sm font-bold text-emerald-900">
+                        إذا لم يكن العميل موجوداً، استخدم إنشاء عميل سريع ثم أكمل البيع الآجل.
+                      </div>
                     </div>
 
                     <div className="flex flex-wrap items-center gap-2">
                       <button
                         className="rounded-full border border-emerald-300 bg-white px-4 py-2 text-sm font-black text-emerald-800 transition hover:border-emerald-500 hover:text-emerald-900"
                         onClick={() => {
-                          setQuickCustomerName(customerNameInput.trim())
+                          setQuickCustomerName('')
                           setQuickCustomerPhone('')
                           setIsQuickCustomerFormOpen((current) => !current)
                         }}
@@ -1097,43 +1602,14 @@ export function PosPage() {
                     ) : null}
 
                     <p className="text-xs font-bold text-emerald-800">
-                      {paymentType === 'credit'
-                        ? 'سيتم تسجيل كامل الفاتورة كدين على العميل.'
-                        : 'سيتم تسجيل الفرق غير المقبوض كرصيد مستحق على العميل.'}
+                      سيتم تسجيل كامل الفاتورة كدين على العميل المختار.
                     </p>
                   </div>
                 ) : null}
 
-                <div className="mt-4 grid gap-3 sm:grid-cols-2">
-                  <label className="text-sm font-bold text-stone-700">
-                    المقبوض بالدينار العراقي
-                    <input
-                      className="mt-2 h-12 w-full rounded-2xl border border-stone-300 bg-white px-4 text-right text-base font-bold text-stone-900 outline-none focus:border-teal-500 disabled:cursor-not-allowed disabled:bg-stone-100"
-                      disabled={paymentType === 'credit'}
-                      min="0"
-                      step="250"
-                      type="number"
-                      value={payments.IQD}
-                      onChange={(event) => handlePaymentAmountChange('IQD', event.target.value)}
-                    />
-                  </label>
-                  <label className="text-sm font-bold text-stone-700">
-                    المقبوض بالدولار الأمريكي
-                    <input
-                      className="mt-2 h-12 w-full rounded-2xl border border-stone-300 bg-white px-4 text-right text-base font-bold text-stone-900 outline-none focus:border-teal-500 disabled:cursor-not-allowed disabled:bg-stone-100"
-                      disabled={paymentType === 'credit'}
-                      min="0"
-                      step="0.01"
-                      type="number"
-                      value={payments.USD}
-                      onChange={(event) => handlePaymentAmountChange('USD', event.target.value)}
-                    />
-                  </label>
-                </div>
-
                 <div className="mt-4 grid gap-3 sm:grid-cols-3">
                   <div className="rounded-2xl bg-white px-4 py-4">
-                    <p className="text-xs font-bold text-stone-500">إجمالي المقبوض</p>
+                    <p className="text-xs font-bold text-stone-500">{paymentType === 'cash' ? 'القيمة المسجلة نقداً' : 'إجمالي المقبوض'}</p>
                     <p className="mt-1 font-display text-2xl font-black text-stone-950">{paidDisplay.primary}</p>
                     <p className="text-xs font-bold text-stone-500">{paidDisplay.secondary}</p>
                   </div>
@@ -1148,6 +1624,12 @@ export function PosPage() {
                     <p className="text-xs font-bold text-stone-500">{changeDisplay.secondary}</p>
                   </div>
                 </div>
+
+                {paymentType === 'cash' ? (
+                  <div className="mt-4 rounded-2xl border border-emerald-200 bg-emerald-50/80 px-4 py-4 text-sm font-bold text-emerald-900">
+                    سيتم اعتماد الفاتورة النقدية مباشرة بكامل مبلغها عند الضغط على إتمام البيع.
+                  </div>
+                ) : null}
               </div>
 
               <div className="mt-5 grid gap-3 sm:grid-cols-2">
@@ -1157,7 +1639,7 @@ export function PosPage() {
                   onClick={finalizeSale}
                   type="button"
                 >
-                  {isSubmitting ? 'جارٍ حفظ الفاتورة...' : paymentType === 'cash' ? 'تثبيت الدفع النقدي' : paymentType === 'partial' ? 'تسجيل بيع جزئي' : 'تسجيل بيع آجل'}
+                    {isSubmitting ? 'جارٍ حفظ الفاتورة...' : paymentType === 'cash' ? 'اتمام البيع' : 'تسجيل بيع آجل'}
                 </button>
                 <button className="rounded-2xl border border-stone-300 px-4 py-3 text-base font-black text-stone-800 transition hover:border-teal-500 hover:text-teal-700" type="button">
                   تعليق الفاتورة
@@ -1166,62 +1648,84 @@ export function PosPage() {
             </section>
 
             <section className="rounded-[32px] border border-stone-200/80 bg-[linear-gradient(180deg,#0f172a_0%,#162233_100%)] p-5 text-white shadow-[0_28px_90px_rgba(17,24,39,0.18)] sm:p-6">
-              <p className="text-sm font-black tracking-[0.2em] text-teal-200/80">QUICK PRODUCTS</p>
-              <h2 className="mt-2 font-display text-3xl font-black">إضافة سريعة</h2>
-              <div className="mt-5 grid gap-3">
-                {products.map((product) => {
-                  const stockSummaries = getProductStockSummaries(product)
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-black tracking-[0.2em] text-teal-200/80">QUICK PRODUCTS</p>
+                  <h2 className="mt-2 font-display text-3xl font-black">إضافة سريعة</h2>
+                </div>
+                <button
+                  className="rounded-full border border-white/20 bg-white/10 px-4 py-2 text-xs font-black text-teal-100 transition hover:border-teal-300 hover:bg-white/20"
+                  onClick={() => setIsQuickProductsOpen((current) => !current)}
+                  type="button"
+                >
+                  {isQuickProductsOpen ? 'إخفاء قائمة الأصناف السريعة' : 'عرض قائمة الأصناف السريعة'}
+                </button>
+              </div>
 
-                  return (
-                  <div key={product.id} className="rounded-[24px] border border-white/10 bg-white/6 p-4 text-right">
-                    <div className="flex items-center justify-between gap-3">
-                      <div>
-                        <p className="font-display text-xl font-black text-white">{product.name}</p>
-                        <p className="mt-1 text-sm text-stone-300">{product.department}</p>
-                        <p className="mt-1 text-xs text-stone-400">
-                          المتبقي بالمفرد: {stockSummaries.retail}
-                        </p>
-                        {stockSummaries.wholesale ? (
-                          <p className="mt-1 text-xs text-stone-400">
-                            المتبقي بالجملة: {stockSummaries.wholesale}
-                          </p>
-                        ) : null}
+              {isQuickProductsOpen ? (
+                <>
+                  <div className="mt-5 grid gap-3">
+                    {products.map((product) => {
+                      const stockSummaries = getProductStockSummaries(product)
+                      const productDisplay = getProductDisplayParts(product)
+
+                      return (
+                      <div key={product.id} className="rounded-[24px] border border-white/10 bg-white/6 p-4 text-right">
+                        <div className="flex items-center justify-between gap-3">
+                          <div>
+                            <p className="font-display text-xl font-black text-white">{productDisplay.title}</p>
+                            {productDisplay.subtitle ? <p className="mt-1 text-sm font-bold text-teal-100">{productDisplay.subtitle}</p> : null}
+                            <p className="mt-1 text-sm text-stone-300">{product.department}</p>
+                            <p className="mt-1 text-xs text-stone-400">
+                              المتبقي بالمفرد: {stockSummaries.retail}
+                            </p>
+                            {stockSummaries.wholesale ? (
+                              <p className="mt-1 text-xs text-stone-400">
+                                المتبقي بالجملة: {stockSummaries.wholesale}
+                              </p>
+                            ) : null}
+                          </div>
+                          <span className="rounded-full bg-white/10 px-3 py-1 text-xs font-black text-teal-100">
+                            {product.soldByWeight ? 'وزني' : hasWholesaleOption(product) ? 'مفرد + جملة' : 'مفرد'}
+                          </span>
+                        </div>
+
+                        <div className="mt-4 grid gap-2 sm:grid-cols-2">
+                          {getProductSaleModes(product).map((saleUnit) => {
+                            const unitLabel = getSaleUnitLabel(product, saleUnit)
+                            const unitPrice = saleUnit === 'wholesale' && product.wholesaleSalePrice !== undefined ? product.wholesaleSalePrice : product.unitPrice
+
+                            return (
+                              <button
+                                key={`${product.id}-${saleUnit}`}
+                                className="rounded-2xl border border-white/10 bg-white/8 px-4 py-3 text-right transition hover:border-teal-300 hover:bg-white/12"
+                                onClick={() => handleQuickAdd(product, saleUnit)}
+                                type="button"
+                              >
+                                <p className="text-sm font-black text-white">{saleUnit === 'wholesale' ? 'إضافة بالجملة' : 'إضافة بالمفرد'}</p>
+                                <p className="mt-1 text-sm text-stone-300">{formatMoney(unitPrice, activeCurrency, exchangeRate)} / {unitLabel}</p>
+                                <p className="mt-1 text-xs text-stone-400">{formatMoney(unitPrice, activeCurrency === 'IQD' ? 'USD' : 'IQD', exchangeRate)}</p>
+                              </button>
+                            )
+                          })}
+                        </div>
                       </div>
-                      <span className="rounded-full bg-white/10 px-3 py-1 text-xs font-black text-teal-100">
-                        {product.soldByWeight ? 'وزني' : hasWholesaleOption(product) ? 'مفرد + جملة' : 'مفرد'}
-                      </span>
-                    </div>
-
-                    <div className="mt-4 grid gap-2 sm:grid-cols-2">
-                      {getProductSaleModes(product).map((saleUnit) => {
-                        const unitLabel = getSaleUnitLabel(product, saleUnit)
-                        const unitPrice = saleUnit === 'wholesale' && product.wholesaleSalePrice !== undefined ? product.wholesaleSalePrice : product.unitPrice
-
-                        return (
-                          <button
-                            key={`${product.id}-${saleUnit}`}
-                            className="rounded-2xl border border-white/10 bg-white/8 px-4 py-3 text-right transition hover:border-teal-300 hover:bg-white/12"
-                            onClick={() => handleQuickAdd(product, saleUnit)}
-                            type="button"
-                          >
-                            <p className="text-sm font-black text-white">{saleUnit === 'wholesale' ? 'إضافة بالجملة' : 'إضافة بالمفرد'}</p>
-                            <p className="mt-1 text-sm text-stone-300">{formatMoney(unitPrice, activeCurrency, exchangeRate)} / {unitLabel}</p>
-                            <p className="mt-1 text-xs text-stone-400">{formatMoney(unitPrice, activeCurrency === 'IQD' ? 'USD' : 'IQD', exchangeRate)}</p>
-                          </button>
-                        )
-                      })}
-                    </div>
+                      )
+                    })}
                   </div>
-                  )
-                })}
-              </div>
-              <div className="mt-4 rounded-[24px] border border-dashed border-white/10 bg-black/15 px-4 py-3 text-sm text-stone-300">
-                {isCatalogLoading
-                  ? 'جارٍ تحميل الأصناف من الخادم...'
-                  : isUsingFallbackCatalog
-                    ? 'يتم حالياً استخدام كتالوج محلي احتياطي لعدم توفر الخادم.'
-                    : `تم تحميل ${products.length} صنف من الخادم.`}
-              </div>
+                  <div className="mt-4 rounded-[24px] border border-dashed border-white/10 bg-black/15 px-4 py-3 text-sm text-stone-300">
+                    {isCatalogLoading
+                      ? 'جارٍ تحميل الأصناف من الخادم...'
+                      : isUsingFallbackCatalog
+                        ? 'يتم حالياً استخدام كتالوج محلي احتياطي لعدم توفر الخادم.'
+                        : `تم تحميل ${products.length} صنف من الخادم.`}
+                  </div>
+                </>
+              ) : (
+                <div className="mt-4 rounded-[24px] border border-dashed border-white/15 bg-black/15 px-4 py-3 text-sm text-stone-200">
+                  لواجهة أبسط، تم إخفاء قائمة الأصناف السريعة افتراضياً. استخدم الزر أعلاه لعرضها عند الحاجة.
+                </div>
+              )}
             </section>
 
             <section className="rounded-[32px] border border-white/70 bg-white/82 p-5 shadow-[0_24px_80px_rgba(77,60,27,0.10)] backdrop-blur-xl sm:p-6">

@@ -9,6 +9,7 @@ export const supplierPaymentSchema = z.object({
   currencyCode: z.enum(['IQD', 'USD']).default('IQD'),
   exchangeRate: z.number().positive(),
   amount: z.number().positive(),
+  sourceFundAccountId: z.string().min(1).optional().or(z.literal('')),
   notes: z.string().max(500).optional().or(z.literal('')),
 })
 

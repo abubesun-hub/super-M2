@@ -93,9 +93,17 @@ export function createCustomerPayment(input) {
         exchangeRate: input.exchangeRate,
         amount: roundMoney(input.amount),
         amountIqd: roundMoney(input.amountIqd),
+        shiftId: input.shiftId,
+        terminalName: input.terminalName,
+        destinationFundAccountId: input.destinationFundAccountId,
+        destinationFundAccountName: input.destinationFundAccountName,
         notes: input.notes?.trim() || undefined,
         createdAt: new Date().toISOString(),
     };
     storedCustomerPayments.unshift(payment);
     return { ...payment };
+}
+export function resetCustomersStore() {
+    storedCustomers.splice(0, storedCustomers.length);
+    storedCustomerPayments.splice(0, storedCustomerPayments.length);
 }

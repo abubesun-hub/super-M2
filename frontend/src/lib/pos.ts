@@ -1,6 +1,8 @@
 export type Product = {
   id: string
   name: string
+  productFamilyName: string
+  variantLabel?: string
   barcode: string
   wholesaleBarcode?: string
   plu?: string
@@ -29,6 +31,8 @@ export type CartLine = {
   lineId: string
   productId: string
   name: string
+  productFamilyName: string
+  variantLabel?: string
   barcode: string
   quantity: number
   baseQuantity: number
@@ -59,6 +63,7 @@ export const sampleCatalog: Product[] = [
   {
     id: 'prod-water',
     name: 'مياه معدنية 600 مل',
+    productFamilyName: 'مياه معدنية 600 مل',
     barcode: '6281000010012',
     wholesaleBarcode: '6281000011019',
     department: 'المشروبات',
@@ -81,6 +86,7 @@ export const sampleCatalog: Product[] = [
   {
     id: 'prod-bread',
     name: 'خبز عربي كبير',
+    productFamilyName: 'خبز عربي كبير',
     barcode: '6281000010029',
     department: 'المخبوزات',
     measurementType: 'unit',
@@ -98,6 +104,7 @@ export const sampleCatalog: Product[] = [
   {
     id: 'prod-cheese',
     name: 'جبنة بيضاء ميزان',
+    productFamilyName: 'جبنة بيضاء ميزان',
     barcode: '2400150000000',
     wholesaleBarcode: '6281000012016',
     plu: '0015',
@@ -122,6 +129,7 @@ export const sampleCatalog: Product[] = [
   {
     id: 'prod-meat',
     name: 'لحم مفروم طازج',
+    productFamilyName: 'لحم مفروم طازج',
     barcode: '2400210000000',
     plu: '0021',
     department: 'اللحوم',
@@ -141,6 +149,7 @@ export const sampleCatalog: Product[] = [
   {
     id: 'prod-detergent',
     name: 'منظف أرضيات 1 لتر',
+    productFamilyName: 'منظف أرضيات 1 لتر',
     barcode: '6281000010036',
     wholesaleBarcode: '6281000011033',
     department: 'المنظفات',
@@ -163,6 +172,7 @@ export const sampleCatalog: Product[] = [
   {
     id: 'prod-dates',
     name: 'تمر فاخر 500 جم',
+    productFamilyName: 'تمر فاخر 500 جم',
     barcode: '6281000010043',
     wholesaleBarcode: '6281000011040',
     department: 'التمور',
@@ -199,6 +209,12 @@ export function parseScaleBarcode(scan: string): ScaleBarcodeResult | null {
   }
 
   return { plu, totalPrice }
+}
+
+export function buildProductDisplayName(productFamilyName: string, variantLabel?: string) {
+  const normalizedFamilyName = productFamilyName.trim()
+  const normalizedVariantLabel = variantLabel?.trim()
+  return normalizedVariantLabel ? `${normalizedFamilyName} - ${normalizedVariantLabel}` : normalizedFamilyName
 }
 
 export function findProductByScan(products: Product[], scan: string): ProductScanMatch | null {
@@ -292,6 +308,8 @@ export function createCartLine(
     lineId: getLineId(product.id, saleUnit),
     productId: product.id,
     name: product.name,
+    productFamilyName: product.productFamilyName,
+    variantLabel: product.variantLabel,
     barcode: getSaleBarcode(product, saleUnit),
     quantity: safeQuantity,
     baseQuantity,

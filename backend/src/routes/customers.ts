@@ -1,9 +1,13 @@
 import { Router } from 'express'
 import { ZodError } from 'zod'
 import { getDataAccess } from '../data/index.js'
+import { requireEmployeePermission } from '../middleware/employee-auth.js'
 import { customerPaymentSchema, customerUpsertSchema } from '../modules/customers/schemas.js'
+import { sendAuthError, sendOperationError, sendValidationError } from './error-response.js'
 
 export const customersRouter = Router()
+
+customersRouter.use(requireEmployeePermission('customers', ['admin', 'cashier']))
 
 customersRouter.get('/', async (_request, response) => {
   const dataAccess = getDataAccess()
@@ -27,11 +31,11 @@ customersRouter.post('/', async (request, response) => {
     response.status(201).json({ data: customer })
   } catch (error) {
     if (error instanceof ZodError) {
-      response.status(400).json({ message: 'بيانات العميل غير صالحة.', issues: error.issues })
+      sendValidationError(response, 'بيانات العميل غير صالحة.', error.issues)
       return
     }
 
-    response.status(400).json({ message: error instanceof Error ? error.message : 'تعذر إنشاء العميل.' })
+    sendOperationError(response, error, 'تعذر إنشاء العميل.')
   }
 })
 
@@ -49,11 +53,11 @@ customersRouter.put('/:customerId', async (request, response) => {
     response.json({ data: customer })
   } catch (error) {
     if (error instanceof ZodError) {
-      response.status(400).json({ message: 'بيانات العميل غير صالحة.', issues: error.issues })
+      sendValidationError(response, 'بيانات العميل غير صالحة.', error.issues)
       return
     }
 
-    response.status(400).json({ message: error instanceof Error ? error.message : 'تعذر تعديل العميل.' })
+    sendOperationError(response, error, 'تعذر تعديل العميل.')
   }
 })
 
@@ -63,7 +67,7 @@ customersRouter.delete('/:customerId', async (request, response) => {
     const customer = await dataAccess.customers.deleteCustomer(request.params.customerId)
     response.json({ data: customer })
   } catch (error) {
-    response.status(400).json({ message: error instanceof Error ? error.message : 'تعذر حذف العميل.' })
+    sendOperationError(response, error, 'تعذر حذف العميل.')
   }
 })
 
@@ -73,7 +77,7 @@ customersRouter.get('/:customerId/payments', async (request, response) => {
     const payments = await dataAccess.customers.listPayments(request.params.customerId)
     response.json({ data: payments })
   } catch (error) {
-    response.status(400).json({ message: error instanceof Error ? error.message : 'تعذر تحميل تسديدات العميل.' })
+    sendOperationError(response, error, 'تعذر تحميل تسديدات العميل.')
   }
 })
 
@@ -81,18 +85,27 @@ customersRouter.post('/:customerId/payments', async (request, response) => {
   try {
     const dataAccess = getDataAccess()
     const payload = customerPaymentSchema.parse(request.body)
+    const employee = request.authEmployee
+
+    if (!employee) {
+      sendAuthError(response, 'يجب تسجيل الدخول أولاً.')
+      return
+    }
+
     const payment = await dataAccess.customers.createPayment(request.params.customerId, {
       ...payload,
       notes: payload.notes || undefined,
+      createdByEmployeeId: employee.id,
+      createdByEmployeeName: employee.name,
     })
 
     response.status(201).json({ data: payment })
   } catch (error) {
     if (error instanceof ZodError) {
-      response.status(400).json({ message: 'بيانات تسديد العميل غير صالحة.', issues: error.issues })
+      sendValidationError(response, 'بيانات تسديد العميل غير صالحة.', error.issues)
       return
     }
 
-    response.status(400).json({ message: error instanceof Error ? error.message : 'تعذر تسجيل تسديد العميل.' })
+    sendOperationError(response, error, 'تعذر تسجيل تسديد العميل.')
   }
 })

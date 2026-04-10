@@ -23,7 +23,11 @@ export const saleInvoicePaymentSchema = z.object({
 })
 
 export const createSaleInvoiceSchema = z.object({
-  paymentType: z.enum(['cash', 'credit', 'partial']).default('cash'),
+  paymentType: z.enum(['cash', 'credit']).default('cash'),
+  employeeId: z.string().min(1),
+  employeeName: z.string().min(2).max(200),
+  shiftId: z.string().min(1),
+  terminalName: z.string().min(2).max(100),
   customerId: z.string().min(1).optional(),
   customerName: z.string().min(2).max(200).optional(),
   currencyCode: z.enum(['IQD', 'USD']).default('IQD'),
@@ -46,11 +50,11 @@ export const createSaleInvoiceSchema = z.object({
     })
   }
 
-  if ((value.paymentType === 'credit' || value.paymentType === 'partial') && !hasCustomer) {
+  if (value.paymentType === 'credit' && !hasCustomer) {
     context.addIssue({
       code: z.ZodIssueCode.custom,
       path: ['customerId'],
-      message: 'حدد العميل أو أدخل اسمه عند البيع بالآجل أو الجزئي.',
+      message: 'حدد العميل عند البيع الآجل.',
     })
   }
 
@@ -62,21 +66,6 @@ export const createSaleInvoiceSchema = z.object({
     })
   }
 
-  if (value.paymentType === 'partial' && paidIqd <= 0) {
-    context.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ['payments'],
-      message: 'البيع الجزئي يتطلب دفعة أولية أكبر من صفر.',
-    })
-  }
-
-  if (value.paymentType === 'partial' && paidIqd + 0.01 >= value.totalAmount) {
-    context.addIssue({
-      code: z.ZodIssueCode.custom,
-      path: ['payments'],
-      message: 'إذا تم دفع كامل المبلغ فاستخدم نوع الدفع النقدي بدلاً من الجزئي.',
-    })
-  }
 })
 
 export type CreateSaleInvoiceInput = z.infer<typeof createSaleInvoiceSchema>
@@ -86,8 +75,11 @@ export const saleReturnItemSchema = z.object({
   quantity: z.number().positive(),
 })
 
+export const saleReturnSettlementTypeSchema = z.enum(['cash-refund', 'deduct-customer-balance'])
+
 export const createSaleReturnSchema = z.object({
   reason: z.string().min(3).max(300),
+  settlementType: saleReturnSettlementTypeSchema,
   items: z.array(saleReturnItemSchema).min(1),
 })
 

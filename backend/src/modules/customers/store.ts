@@ -18,6 +18,10 @@ export type CustomerPayment = {
   exchangeRate: number
   amount: number
   amountIqd: number
+  shiftId?: string
+  terminalName?: string
+  destinationFundAccountId?: string
+  destinationFundAccountName?: string
   notes?: string
   createdAt: string
 }
@@ -36,6 +40,10 @@ export type CustomerPaymentRecordInput = {
   exchangeRate: number
   amount: number
   amountIqd: number
+  shiftId?: string
+  terminalName?: string
+  destinationFundAccountId?: string
+  destinationFundAccountName?: string
   notes?: string
 }
 
@@ -163,10 +171,19 @@ export function createCustomerPayment(input: CustomerPaymentRecordInput) {
     exchangeRate: input.exchangeRate,
     amount: roundMoney(input.amount),
     amountIqd: roundMoney(input.amountIqd),
+    shiftId: input.shiftId,
+    terminalName: input.terminalName,
+    destinationFundAccountId: input.destinationFundAccountId,
+    destinationFundAccountName: input.destinationFundAccountName,
     notes: input.notes?.trim() || undefined,
     createdAt: new Date().toISOString(),
   }
 
   storedCustomerPayments.unshift(payment)
   return { ...payment }
+}
+
+export function resetCustomersStore() {
+  storedCustomers.splice(0, storedCustomers.length)
+  storedCustomerPayments.splice(0, storedCustomerPayments.length)
 }

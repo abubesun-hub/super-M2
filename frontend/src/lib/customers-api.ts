@@ -1,4 +1,6 @@
 import type { CurrencyCode } from './currency'
+import { apiFetch } from './api'
+import { getUserFacingApiErrorMessage } from './user-facing-errors'
 
 export type Customer = {
   id: string
@@ -20,6 +22,10 @@ export type CustomerPayment = {
   exchangeRate: number
   amount: number
   amountIqd: number
+  shiftId?: string
+  terminalName?: string
+  destinationFundAccountId?: string
+  destinationFundAccountName?: string
   notes?: string
   createdAt: string
 }
@@ -38,12 +44,8 @@ export type CustomerPaymentPayload = {
   notes?: string
 }
 
-function getApiBaseUrl() {
-  return import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:4000/api'
-}
-
 export async function fetchCustomers() {
-  const response = await fetch(`${getApiBaseUrl()}/customers`)
+  const response = await apiFetch('/customers')
 
   if (!response.ok) {
     throw new Error('تعذر تحميل العملاء من الخادم.')
@@ -54,7 +56,7 @@ export async function fetchCustomers() {
 }
 
 export async function createCustomer(payload: CustomerUpsertPayload) {
-  const response = await fetch(`${getApiBaseUrl()}/customers`, {
+  const response = await apiFetch('/customers', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -64,7 +66,7 @@ export async function createCustomer(payload: CustomerUpsertPayload) {
 
   if (!response.ok) {
     const errorBody = (await response.json().catch(() => null)) as { message?: string } | null
-    throw new Error(errorBody?.message ?? 'تعذر إنشاء العميل.')
+    throw new Error(getUserFacingApiErrorMessage(errorBody?.message, 'تعذر إنشاء العميل.'))
   }
 
   const body = (await response.json()) as { data: Customer }
@@ -72,7 +74,7 @@ export async function createCustomer(payload: CustomerUpsertPayload) {
 }
 
 export async function updateCustomer(customerId: string, payload: CustomerUpsertPayload) {
-  const response = await fetch(`${getApiBaseUrl()}/customers/${customerId}`, {
+  const response = await apiFetch(`/customers/${customerId}`, {
     method: 'PUT',
     headers: {
       'Content-Type': 'application/json',
@@ -82,7 +84,7 @@ export async function updateCustomer(customerId: string, payload: CustomerUpsert
 
   if (!response.ok) {
     const errorBody = (await response.json().catch(() => null)) as { message?: string } | null
-    throw new Error(errorBody?.message ?? 'تعذر تعديل العميل.')
+    throw new Error(getUserFacingApiErrorMessage(errorBody?.message, 'تعذر تعديل العميل.'))
   }
 
   const body = (await response.json()) as { data: Customer }
@@ -90,13 +92,13 @@ export async function updateCustomer(customerId: string, payload: CustomerUpsert
 }
 
 export async function deleteCustomer(customerId: string) {
-  const response = await fetch(`${getApiBaseUrl()}/customers/${customerId}`, {
+  const response = await apiFetch(`/customers/${customerId}`, {
     method: 'DELETE',
   })
 
   if (!response.ok) {
     const errorBody = (await response.json().catch(() => null)) as { message?: string } | null
-    throw new Error(errorBody?.message ?? 'تعذر حذف العميل.')
+    throw new Error(getUserFacingApiErrorMessage(errorBody?.message, 'تعذر حذف العميل.'))
   }
 
   const body = (await response.json()) as { data: Customer }
@@ -104,11 +106,11 @@ export async function deleteCustomer(customerId: string) {
 }
 
 export async function fetchCustomerPayments(customerId: string) {
-  const response = await fetch(`${getApiBaseUrl()}/customers/${customerId}/payments`)
+  const response = await apiFetch(`/customers/${customerId}/payments`)
 
   if (!response.ok) {
     const errorBody = (await response.json().catch(() => null)) as { message?: string } | null
-    throw new Error(errorBody?.message ?? 'تعذر تحميل تسديدات العميل.')
+    throw new Error(getUserFacingApiErrorMessage(errorBody?.message, 'تعذر تحميل تسديدات العميل.'))
   }
 
   const body = (await response.json()) as { data: CustomerPayment[] }
@@ -116,7 +118,7 @@ export async function fetchCustomerPayments(customerId: string) {
 }
 
 export async function createCustomerPayment(customerId: string, payload: CustomerPaymentPayload) {
-  const response = await fetch(`${getApiBaseUrl()}/customers/${customerId}/payments`, {
+  const response = await apiFetch(`/customers/${customerId}/payments`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
@@ -126,7 +128,7 @@ export async function createCustomerPayment(customerId: string, payload: Custome
 
   if (!response.ok) {
     const errorBody = (await response.json().catch(() => null)) as { message?: string } | null
-    throw new Error(errorBody?.message ?? 'تعذر تسجيل التسديد.')
+    throw new Error(getUserFacingApiErrorMessage(errorBody?.message, 'تعذر تسجيل التسديد.'))
   }
 
   const body = (await response.json()) as { data: CustomerPayment }

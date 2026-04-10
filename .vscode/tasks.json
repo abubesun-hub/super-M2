@@ -1,0 +1,113 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Build frontend",
+			"type": "shell",
+			"command": "cd \"E:/test/superM all/super M2/frontend\" && npm run build",
+			"isBackground": false
+		},
+		{
+			"label": "Start backend dev",
+			"type": "shell",
+			"command": "cd \"E:/test/superM all/super M2/backend\" && npm run dev",
+			"isBackground": true
+		},
+		{
+			"label": "Start app on 4001",
+			"type": "shell",
+			"command": "Set-Location -LiteralPath 'E:/test/superM all/super M2/frontend'; npm run build; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; Set-Location -LiteralPath 'E:/test/superM all/super M2/backend'; npm run dev",
+			"isBackground": true
+		},
+		{
+			"label": "Build frontend",
+			"type": "shell",
+			"command": "Set-Location \"E:/test/superM all/super M2/frontend\"; npm run build",
+			"isBackground": false
+		},
+		{
+			"label": "Start backend dev",
+			"type": "shell",
+			"command": "Set-Location \"E:/test/superM all/super M2/backend\"; npm run dev",
+			"isBackground": true
+		},
+		{
+			"label": "Build frontend fixed",
+			"type": "shell",
+			"command": "Set-Location \"E:/test/superM all/super M2/frontend\"; npm run build",
+			"isBackground": false
+		},
+		{
+			"label": "Start backend dev fixed",
+			"type": "shell",
+			"command": "Set-Location \"E:/test/superM all/super M2/backend\"; npm run dev",
+			"isBackground": true
+		},
+		{
+			"label": "Build frontend literal",
+			"type": "shell",
+			"command": "Set-Location -LiteralPath 'E:/test/superM all/super M2/frontend'; npm run build",
+			"isBackground": false
+		},
+		{
+			"label": "Start backend dev literal",
+			"type": "shell",
+			"command": "Set-Location -LiteralPath 'E:/test/superM all/super M2/backend'; npm run dev",
+			"isBackground": true
+		},
+		{
+			"label": "Start frontend preview 4175",
+			"type": "shell",
+			"command": "Set-Location -LiteralPath 'E:/test/superM all/super M2/frontend'; npm run dev -- --host 0.0.0.0 --port 4175 --strictPort",
+			"isBackground": true
+		},
+		{
+			"label": "Stop preview 4174",
+			"type": "shell",
+			"command": "Get-NetTCPConnection -LocalPort 4174 -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique | ForEach-Object { Stop-Process -Id $_ -Force }",
+			"isBackground": false
+		},
+		{
+			"label": "Start frontend preview 4174 fresh",
+			"type": "shell",
+			"command": "Set-Location -LiteralPath 'E:/test/superM all/super M2/frontend'; npm run dev:live",
+			"isBackground": true
+		},
+		{
+			"label": "copilot-build-frontend-preview",
+			"type": "shell",
+			"command": "Set-Location -LiteralPath 'E:/test/superM all/super M2/frontend'; npm run build",
+			"isBackground": false
+		},
+		{
+			"label": "copilot-start-backend-preview",
+			"type": "shell",
+			"command": "Set-Location -LiteralPath 'E:/test/superM all/super M2/backend'; npm run dev",
+			"isBackground": true
+		},
+		{
+			"label": "copilot-start-frontend-preview-4174",
+			"type": "shell",
+			"command": "Set-Location -LiteralPath 'E:/test/superM all/super M2/frontend'; npm run dev:live",
+			"isBackground": true
+		},
+		{
+			"label": "copilot-check-port-4001",
+			"type": "shell",
+			"command": "powershell -NoProfile -Command \"Test-NetConnection -ComputerName 127.0.0.1 -Port 4001 | Select-Object ComputerName,RemotePort,TcpTestSucceeded | Format-List\"",
+			"isBackground": false
+		},
+		{
+			"label": "copilot-check-port-4174",
+			"type": "shell",
+			"command": "powershell -NoProfile -Command \"Test-NetConnection -ComputerName 127.0.0.1 -Port 4174 | Select-Object ComputerName,RemotePort,TcpTestSucceeded | Format-List\"",
+			"isBackground": false
+		},
+		{
+			"label": "copilot-start-preview-stack",
+			"type": "shell",
+			"command": "Start-Process powershell -ArgumentList '-NoExit','-Command',\"Set-Location -LiteralPath ''E:/test/superM all/super M2/backend''; npm run dev\"; Start-Process powershell -ArgumentList '-NoExit','-Command',\"Set-Location -LiteralPath ''E:/test/superM all/super M2/frontend''; npm run dev:live\"; Write-Host 'Backend and frontend live preview started.'",
+			"isBackground": false
+		}
+	]
+}

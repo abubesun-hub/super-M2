@@ -1,6 +1,16 @@
 import type { StockMovement } from './products-api'
 import type { StoredSaleInvoice } from './sales-api'
 import type { Product } from './pos'
+import { apiFetch } from './api'
+
+export type DashboardSummaryPeriodPreset = 'today' | 'month' | 'year' | 'all' | 'custom'
+
+export type DashboardSummaryPeriod = {
+  preset: DashboardSummaryPeriodPreset
+  startDate?: string
+  endDate?: string
+  label: string
+}
 
 export type DashboardStorageInfo = {
   driver: 'memory' | 'postgres'
@@ -9,9 +19,8 @@ export type DashboardStorageInfo = {
   message: string
 }
 
-export type DashboardHourlySales = {
-  bucketStartHour: number
-  bucketEndHour: number
+export type DashboardSalesTimelinePoint = {
+  bucketKey: string
   label: string
   invoicesCount: number
   salesTotal: number
@@ -33,15 +42,18 @@ export type DashboardProfitProduct = {
 }
 
 export type DashboardSummary = {
-  todaysSalesCount: number
-  todaysSalesTotal: number
-  todaysEstimatedProfit: number
-  todaysReturnsCount: number
+  period: DashboardSummaryPeriod
+  salesCount: number
+  salesTotal: number
+  estimatedProfit: number
+  returnsCount: number
   lowStockCount: number
   productsCount: number
   inventoryValue: number
   storage: DashboardStorageInfo
-  hourlySales: DashboardHourlySales[]
+  salesTimeline: DashboardSalesTimelinePoint[]
+  salesTimelineTitle: string
+  salesTimelineSubtitle: string
   departmentBreakdown: DashboardDepartmentMetric[]
   topProfitProducts: DashboardProfitProduct[]
   recentInvoices: StoredSaleInvoice[]
@@ -49,12 +61,26 @@ export type DashboardSummary = {
   recentMovements: StockMovement[]
 }
 
-function getApiBaseUrl() {
-  return import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:4000/api'
-}
+export async function fetchDashboardSummary(filter?: {
+  preset?: DashboardSummaryPeriodPreset
+  startDate?: string
+  endDate?: string
+}) {
+  const params = new URLSearchParams()
 
-export async function fetchDashboardSummary() {
-  const response = await fetch(`${getApiBaseUrl()}/dashboard/summary`)
+  if (filter?.preset) {
+    params.set('preset', filter.preset)
+  }
+
+  if (filter?.startDate) {
+    params.set('startDate', filter.startDate)
+  }
+
+  if (filter?.endDate) {
+    params.set('endDate', filter.endDate)
+  }
+
+  const response = await apiFetch(`/dashboard/summary${params.size ? `?${params.toString()}` : ''}`)
 
   if (!response.ok) {
     throw new Error('تعذر تحميل ملخص لوحة التشغيل.')

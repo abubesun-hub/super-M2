@@ -1,17 +1,24 @@
 import { useEffect, useState } from 'react'
 import { Link } from 'react-router-dom'
+import { FeedbackMessage } from '../components/FeedbackMessage'
+import { SuggestionInput } from '../components/SuggestionInput'
+import { useEmployeeSession } from '../lib/auth'
 import { IQD_PER_USD, formatDualMoney, formatMoney, type CurrencyCode } from '../lib/currency'
 import { exportRowsToCsv } from '../lib/export'
-import type { Product } from '../lib/pos'
+import { fetchFundAccounts } from '../lib/funds-api'
+import { buildProductDisplayName, type Product } from '../lib/pos'
 import { fetchProducts } from '../lib/products-api'
+import { getUserFacingErrorMessage } from '../lib/user-facing-errors'
 import {
   createSupplier,
+  deletePurchaseReceipt,
   deleteSupplier,
   fetchPurchaseReceipts,
   fetchSupplierPayments,
   fetchSuppliers,
   submitPurchaseReceipt,
   submitSupplierPayment,
+  updatePurchaseReceipt,
   updateSupplier,
   type StoredPurchaseReceipt,
   type Supplier,
@@ -28,6 +35,7 @@ const weightWholesaleUnits = ['كيس', 'شوال', 'تنكة']
 
 type ProductDraftState = {
   name: string
+  variantLabel: string
   barcode: string
   wholesaleBarcode: string
   plu: string
@@ -51,9 +59,22 @@ type ReceiptLineState = {
   draft: ProductDraftState
 }
 
+type ProductFamilyProfile = {
+  familyName: string
+  variantSuggestions: string[]
+  department: string
+  measurementType: 'unit' | 'weight'
+  retailUnit: string
+  wholesaleUnit: string
+  wholesaleQuantity: string
+  vatRate: string
+  skuCount: number
+}
+
 function emptyDraft(): ProductDraftState {
   return {
     name: '',
+    variantLabel: '',
     barcode: '',
     wholesaleBarcode: '',
     plu: '',
@@ -137,9 +158,13 @@ function findProductByAnyBarcode(products: Product[], barcode: string) {
 
 function normalizeDraftPayload(draft: ProductDraftState): PurchaseReceiptProductDraftPayload {
   const vatRatePercent = Number(draft.vatRate)
+  const productFamilyName = draft.name.trim()
+  const variantLabel = draft.variantLabel.trim() || undefined
 
   return {
-    name: draft.name.trim(),
+    name: buildProductDisplayName(productFamilyName, variantLabel),
+    productFamilyName,
+    variantLabel,
     barcode: draft.barcode.trim(),
     wholesaleBarcode: draft.wholesaleBarcode.trim() || undefined,
     plu: draft.plu.trim() || undefined,
@@ -178,6 +203,10 @@ function roundMoney(value: number) {
   return Number(value.toFixed(2))
 }
 
+function formatQuantity(value: number) {
+  return Number.isInteger(value) ? String(value) : value.toFixed(3)
+}
+
 function getTodayDateInputValue() {
   return new Date().toISOString().slice(0, 10)
 }
@@ -203,9 +232,11 @@ function getLedgerInvoiceGroupLabel(invoiceNo?: string) {
 }
 
 export function PurchasesPage() {
+  const { session } = useEmployeeSession()
   const [products, setProducts] = useState<Product[]>([])
   const [receipts, setReceipts] = useState<StoredPurchaseReceipt[]>([])
   const [suppliers, setSuppliers] = useState<Supplier[]>([])
+  const [finalCashBalanceIqd, setFinalCashBalanceIqd] = useState(0)
   const [selectedSupplierId, setSelectedSupplierId] = useState('')
   const [supplierDraftName, setSupplierDraftName] = useState('')
   const [supplierDraftPhone, setSupplierDraftPhone] = useState('')
@@ -217,6 +248,7 @@ export function PurchasesPage() {
   const [paymentNotes, setPaymentNotes] = useState('')
   const [purchaseDate, setPurchaseDate] = useState(getTodayDateInputValue())
   const [supplierInvoiceNo, setSupplierInvoiceNo] = useState('')
+  const [editingReceiptId, setEditingReceiptId] = useState<string | null>(null)
   const [selectedReceiptId, setSelectedReceiptId] = useState<string | null>(null)
   const [ledgerDateFrom, setLedgerDateFrom] = useState('')
   const [ledgerDateTo, setLedgerDateTo] = useState('')
@@ -231,15 +263,61 @@ export function PurchasesPage() {
   const [isSavingSupplier, setIsSavingSupplier] = useState(false)
   const [isLoadingPayments, setIsLoadingPayments] = useState(false)
   const [isSubmittingPayment, setIsSubmittingPayment] = useState(false)
+  const productFamilyProfiles = Array.from(
+    products.reduce((profiles, product) => {
+      const existingProfile = profiles.get(product.productFamilyName)
+
+      if (existingProfile) {
+        if (product.variantLabel && !existingProfile.variantSuggestions.includes(product.variantLabel)) {
+          existingProfile.variantSuggestions.push(product.variantLabel)
+        }
+
+        existingProfile.skuCount += 1
+
+        return profiles
+      }
+
+      profiles.set(product.productFamilyName, {
+        familyName: product.productFamilyName,
+        variantSuggestions: product.variantLabel ? [product.variantLabel] : [],
+        department: product.department,
+        measurementType: product.measurementType,
+        retailUnit: product.retailUnit,
+        wholesaleUnit: product.wholesaleUnit ?? getDefaultWholesaleUnit(product.measurementType),
+        wholesaleQuantity: product.wholesaleQuantity ? String(product.wholesaleQuantity) : '',
+        vatRate: String(roundMoney(product.vatRate * 100)),
+        skuCount: 1,
+      })
+
+      return profiles
+    }, new Map<string, ProductFamilyProfile>()),
+  )
+    .map(([, profile]) => ({
+      ...profile,
+      variantSuggestions: profile.variantSuggestions.sort((left, right) => left.localeCompare(right, 'ar')),
+    }))
+    .sort((left, right) => left.familyName.localeCompare(right.familyName, 'ar'))
 
   async function loadPurchasesData() {
     setIsLoading(true)
 
     try {
-      const [nextProducts, nextReceipts, nextSuppliers] = await Promise.all([fetchProducts(), fetchPurchaseReceipts(), fetchSuppliers()])
+      const [nextProducts, nextReceipts, nextSuppliers, nextFundAccounts] = await Promise.all([
+        fetchProducts(),
+        fetchPurchaseReceipts(),
+        fetchSuppliers(),
+        fetchFundAccounts(),
+      ])
       setProducts(nextProducts)
       setReceipts(nextReceipts)
       setSuppliers(nextSuppliers)
+      setFinalCashBalanceIqd(roundMoney(nextFundAccounts.reduce((sum, account) => {
+        if (!account.isActive || (account.code !== 'revenue' && account.code !== 'capital')) {
+          return sum
+        }
+
+        return sum + account.currentBalanceIqd
+      }, 0)))
       setLines((current) => current.map((line, index) => {
         if (line.mode === 'new') {
           return line
@@ -259,7 +337,7 @@ export function PurchasesPage() {
       setSelectedSupplierId((current) => current && nextSuppliers.some((supplier) => supplier.id === current) ? current : '')
       setMessage(null)
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'تعذر تحميل بيانات المشتريات.')
+      setMessage(getUserFacingErrorMessage(error, 'تعذر تحميل بيانات المشتريات.'))
     } finally {
       setIsLoading(false)
     }
@@ -282,7 +360,7 @@ export function PurchasesPage() {
         const nextPayments = await fetchSupplierPayments(selectedSupplierId)
         setSupplierPayments(nextPayments)
       } catch (error) {
-        setMessage(error instanceof Error ? error.message : 'تعذر تحميل دفعات المورد.')
+        setMessage(getUserFacingErrorMessage(error, 'تعذر تحميل دفعات المورد.'))
       } finally {
         setIsLoadingPayments(false)
       }
@@ -303,6 +381,102 @@ export function PurchasesPage() {
 
   function updateLineDraft(index: number, patch: Partial<ProductDraftState>) {
     setLines((current) => current.map((line, lineIndex) => lineIndex === index ? { ...line, draft: { ...line.draft, ...patch } } : line))
+  }
+
+  function getFamilyProfileByName(productFamilyName: string) {
+    const normalizedFamilyName = productFamilyName.trim()
+    return productFamilyProfiles.find((profile) => profile.familyName === normalizedFamilyName) ?? null
+  }
+
+  function getVariantSuggestions(productFamilyName: string) {
+    return getFamilyProfileByName(productFamilyName)?.variantSuggestions ?? []
+  }
+
+  function getFamilyProducts(productFamilyName: string) {
+    const normalizedFamilyName = productFamilyName.trim()
+
+    if (!normalizedFamilyName) {
+      return []
+    }
+
+    return products
+      .filter((product) => product.productFamilyName === normalizedFamilyName)
+      .slice()
+      .sort((left, right) => left.name.localeCompare(right.name, 'ar'))
+  }
+
+  function getFamilySuggestionOptions() {
+    return productFamilyProfiles.map((profile) => ({
+      value: profile.familyName,
+      description: `${profile.department} | ${profile.measurementType === 'weight' ? 'وزني' : profile.wholesaleQuantity ? 'مفرد + جملة' : 'مفرد'}`,
+      meta: `${profile.skuCount} SKU | ${profile.variantSuggestions.length} أصناف فرعية`,
+      searchTerms: profile.variantSuggestions,
+    }))
+  }
+
+  function getDepartmentSuggestionOptions() {
+    return Array.from(
+      products.reduce((departments, product) => {
+        const departmentName = product.department.trim()
+
+        if (!departmentName) {
+          return departments
+        }
+
+        const existingDepartment = departments.get(departmentName)
+
+        if (existingDepartment) {
+          existingDepartment.productsCount += 1
+          existingDepartment.families.add(product.productFamilyName)
+          return departments
+        }
+
+        departments.set(departmentName, {
+          name: departmentName,
+          productsCount: 1,
+          families: new Set([product.productFamilyName]),
+        })
+
+        return departments
+      }, new Map<string, { name: string; productsCount: number; families: Set<string> }>()),
+    )
+      .map(([, department]) => department)
+      .sort((left, right) => left.name.localeCompare(right.name, 'ar'))
+      .map((department) => ({
+        value: department.name,
+        title: department.name,
+        meta: `${department.productsCount} صنف | ${department.families.size} عائلة`,
+      }))
+  }
+
+  function getVariantSuggestionOptions(productFamilyName: string) {
+    return getFamilyProducts(productFamilyName)
+      .filter((product) => Boolean(product.variantLabel?.trim()))
+      .map((product) => ({
+        value: product.variantLabel?.trim() ?? '',
+        title: product.variantLabel?.trim() ?? '',
+        description: `باركود: ${product.barcode}`,
+        meta: `مخزون ${formatQuantity(product.stockQty)} ${product.retailUnit}`,
+      }))
+  }
+
+  function handleDraftFamilyNameChange(index: number, name: string) {
+    const matchedProfile = getFamilyProfileByName(name)
+
+    if (!matchedProfile) {
+      updateLineDraft(index, { name })
+      return
+    }
+
+    updateLineDraft(index, {
+      name,
+      department: matchedProfile.department,
+      measurementType: matchedProfile.measurementType,
+      retailUnit: matchedProfile.retailUnit,
+      wholesaleUnit: matchedProfile.wholesaleUnit,
+      wholesaleQuantity: matchedProfile.wholesaleQuantity,
+      vatRate: matchedProfile.vatRate,
+    })
   }
 
   function resolveLineBarcode(index: number, rawBarcode: string) {
@@ -525,6 +699,50 @@ export function PurchasesPage() {
   const paymentAmountIqd = Number.isFinite(paymentAmountNumber)
     ? roundMoney(paymentCurrencyCode === 'USD' ? paymentAmountNumber * parsedPaymentExchangeRate : paymentAmountNumber)
     : 0
+  const isEditingReceipt = editingReceiptId !== null
+
+  function resetPurchaseForm() {
+    setEditingReceiptId(null)
+    setSelectedSupplierId('')
+    setPurchaseDate(getTodayDateInputValue())
+    setSupplierInvoiceNo('')
+    setNotes('')
+    setCurrencyCode('IQD')
+    setExchangeRate(String(IQD_PER_USD))
+    setLines([emptyLine(products[0])])
+  }
+
+  function loadReceiptIntoForm(receipt: StoredPurchaseReceipt) {
+    setEditingReceiptId(receipt.id)
+    setSelectedReceiptId(receipt.id)
+    setSelectedSupplierId(receipt.supplierId ?? '')
+    setPurchaseDate(receipt.purchaseDate)
+    setSupplierInvoiceNo(receipt.supplierInvoiceNo ?? '')
+    setNotes(receipt.notes ?? '')
+    setCurrencyCode(receipt.currencyCode)
+    setExchangeRate(String(receipt.exchangeRate))
+    setLines(
+      receipt.items.length > 0
+        ? receipt.items.map((item) => {
+            const product = products.find((entry) => entry.id === item.productId) ?? null
+
+            return {
+              lookupBarcode: item.entryUnit === 'wholesale'
+                ? (product?.wholesaleBarcode ?? product?.barcode ?? '')
+                : (product?.barcode ?? ''),
+              mode: 'existing' as const,
+              productId: item.productId,
+              entryUnit: item.entryUnit,
+              quantity: String(item.quantity),
+              unitCost: String(item.unitCost),
+              batchNo: item.batchNo ?? '',
+              expiryDate: item.expiryDate ?? '',
+              draft: emptyDraft(),
+            }
+          })
+        : [emptyLine(products[0])],
+    )
+  }
 
   async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -565,19 +783,20 @@ export function PurchasesPage() {
       }
 
       const draft = line.draftPayload
+      const draftDisplayName = line.draftPayload ? getDraftDisplayName(line.draft) : 'الصنف الجديد'
 
       if (!draft || draft.name.length < 3 || draft.barcode.trim().length < 3 || draft.department.trim().length < 2 || !draft.retailUnit) {
-        setMessage('اسم الصنف والباركود يجب أن يكون كل منهما 3 أحرف أو أرقام على الأقل، مع إدخال القسم ووحدة المفرد.')
+        setMessage('اسم المنتج الرئيسي والباركود يجب أن يكون كل منهما 3 أحرف أو أرقام على الأقل، مع إدخال القسم ووحدة المفرد.')
         return
       }
 
       if (draft.wholesaleBarcode && draft.wholesaleBarcode.trim().length < 3) {
-        setMessage(`باركود الجملة للصنف ${draft.name} يجب أن يكون 3 أحرف أو أرقام على الأقل.`)
+        setMessage(`باركود الجملة للصنف ${draftDisplayName} يجب أن يكون 3 أحرف أو أرقام على الأقل.`)
         return
       }
 
       if (!Number.isFinite(draft.vatRate) || draft.vatRate < 0) {
-        setMessage(`نسبة الضريبة غير صالحة للصنف ${draft.name}.`)
+        setMessage(`نسبة الضريبة غير صالحة للصنف ${draftDisplayName}.`)
         return
       }
 
@@ -585,22 +804,22 @@ export function PurchasesPage() {
       const hasAnyWholesaleField = Boolean(draft.wholesaleUnit || draft.wholesaleQuantity || draft.wholesaleBarcode)
 
       if (hasAnyWholesaleField && !hasWholesale) {
-        setMessage(`أكمل تعبئة الجملة بالكامل للصنف ${draft.name}: اسم وحدة الجملة وعدد المفردات داخلها.`)
+        setMessage(`أكمل تعبئة الجملة بالكامل للصنف ${draftDisplayName}: اسم وحدة الجملة وعدد المفردات داخلها.`)
         return
       }
 
       if (hasWholesale && !draft.wholesaleBarcode) {
-        setMessage(`أدخل باركود الجملة للصنف ${draft.name}.`)
+        setMessage(`أدخل باركود الجملة للصنف ${draftDisplayName}.`)
         return
       }
 
       if (draft.wholesaleBarcode && draft.wholesaleBarcode === draft.barcode) {
-        setMessage(`يجب أن يختلف باركود الجملة عن باركود المفرد للصنف ${draft.name}.`)
+        setMessage(`يجب أن يختلف باركود الجملة عن باركود المفرد للصنف ${draftDisplayName}.`)
         return
       }
 
       if (line.entryUnit === 'wholesale' && !hasWholesale) {
-        setMessage(`لا يمكن شراء ${draft.name} بالجملة قبل تحديد وحدة الجملة وعددها وباركودها.`)
+        setMessage(`لا يمكن شراء ${draftDisplayName} بالجملة قبل تحديد وحدة الجملة وعددها وباركودها.`)
         return
       }
     }
@@ -608,7 +827,7 @@ export function PurchasesPage() {
     setIsSubmitting(true)
 
     try {
-      await submitPurchaseReceipt({
+      const payload = {
         supplierId: selectedSupplierId || undefined,
         purchaseDate: purchaseDate || undefined,
         supplierInvoiceNo: supplierInvoiceNo.trim() || undefined,
@@ -625,19 +844,52 @@ export function PurchasesPage() {
             ? { productId: line.productId }
             : { productDraft: line.draftPayload ?? undefined }),
         })),
-      })
+      }
+      const savedReceipt = editingReceiptId
+        ? await updatePurchaseReceipt(editingReceiptId, payload)
+        : await submitPurchaseReceipt(payload)
 
-      setSelectedSupplierId('')
-      setPurchaseDate(getTodayDateInputValue())
-      setSupplierInvoiceNo('')
-      setNotes('')
-      setCurrencyCode('IQD')
-      setExchangeRate(String(IQD_PER_USD))
-      setLines([emptyLine(products[0])])
+      resetPurchaseForm()
+      setSelectedReceiptId(savedReceipt.id)
       await loadPurchasesData()
-      setMessage('تم حفظ سند الاستلام وتحديث المخزون بنجاح.')
+      setMessage(editingReceiptId ? 'تم تعديل سند الشراء وتحديث المخزون بنجاح.' : 'تم حفظ سند الاستلام وتحديث المخزون بنجاح.')
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'تعذر حفظ سند الشراء.')
+      setMessage(getUserFacingErrorMessage(error, editingReceiptId ? 'تعذر تعديل سند الشراء.' : 'تعذر حفظ سند الشراء.'))
+    } finally {
+      setIsSubmitting(false)
+    }
+  }
+
+  function handleEditReceipt(receipt: StoredPurchaseReceipt) {
+    loadReceiptIntoForm(receipt)
+    setMessage(`تم تحميل السند ${receipt.receiptNo} للتعديل.`)
+    window.scrollTo({ top: 0, behavior: 'smooth' })
+  }
+
+  async function handleDeleteReceipt(receipt: StoredPurchaseReceipt) {
+    const confirmed = window.confirm(`سيتم حذف السند ${receipt.receiptNo} وعكس أثره على المخزون إذا كانت كمياته لم تُستهلك بعد. هل تريد المتابعة؟`)
+
+    if (!confirmed) {
+      return
+    }
+
+    setIsSubmitting(true)
+
+    try {
+      await deletePurchaseReceipt(receipt.id)
+
+      if (selectedReceiptId === receipt.id) {
+        setSelectedReceiptId(null)
+      }
+
+      if (editingReceiptId === receipt.id) {
+        resetPurchaseForm()
+      }
+
+      await loadPurchasesData()
+      setMessage('تم حذف سند الشراء وعكس أثره على المخزون بنجاح.')
+    } catch (error) {
+      setMessage(getUserFacingErrorMessage(error, 'تعذر حذف سند الشراء.'))
     } finally {
       setIsSubmitting(false)
     }
@@ -668,7 +920,7 @@ export function PurchasesPage() {
       resetSupplierForm()
       setMessage(editingSupplierId ? 'تم تعديل بيانات المورد.' : 'تمت إضافة المورد الجديد.')
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'تعذر حفظ المورد.')
+      setMessage(getUserFacingErrorMessage(error, 'تعذر حفظ المورد.'))
     } finally {
       setIsSavingSupplier(false)
     }
@@ -692,6 +944,11 @@ export function PurchasesPage() {
       return
     }
 
+    if (paymentAmountIqd > finalCashBalanceIqd + 0.01) {
+      setMessage('رصيد الصندوق لا يكفي لدفع هذا المبلغ.')
+      return
+    }
+
     setIsSubmittingPayment(true)
 
     try {
@@ -708,7 +965,8 @@ export function PurchasesPage() {
       resetPaymentForm()
       setMessage('تم تسجيل دفعة المورد وتحديث الرصيد.')
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'تعذر تسجيل دفعة المورد.')
+      const nextMessage = getUserFacingErrorMessage(error, 'تعذر تسجيل دفعة المورد.')
+      setMessage(nextMessage.includes('الرصيد النقدي النهائي') || nextMessage.includes('رصيد الصندوق لا يكفي') ? 'رصيد الصندوق لا يكفي لدفع هذا المبلغ.' : nextMessage)
     } finally {
       setIsSubmittingPayment(false)
     }
@@ -734,7 +992,7 @@ export function PurchasesPage() {
       await loadPurchasesData()
       setMessage('تم حذف المورد.')
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'تعذر حذف المورد.')
+      setMessage(getUserFacingErrorMessage(error, 'تعذر حذف المورد.'))
     } finally {
       setIsSavingSupplier(false)
     }
@@ -1067,7 +1325,7 @@ export function PurchasesPage() {
   }
 
   return (
-    <main className="min-h-screen bg-[linear-gradient(180deg,#f4efe3_0%,#efe7d8_45%,#f8f5ef_100%)] px-4 py-5 text-stone-900 sm:px-6 lg:px-8">
+    <main className="min-h-screen scroll-smooth bg-[linear-gradient(180deg,#f4efe3_0%,#efe7d8_45%,#f8f5ef_100%)] px-4 py-5 text-stone-900 sm:px-6 lg:px-8">
       <div className="mx-auto max-w-7xl">
         <header className="rounded-[30px] border border-white/75 bg-white/80 px-5 py-4 shadow-[0_24px_80px_rgba(77,60,27,0.10)] backdrop-blur-xl sm:px-6">
           <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
@@ -1075,12 +1333,17 @@ export function PurchasesPage() {
               <p className="text-sm font-black tracking-[0.2em] text-teal-700">PURCHASES HUB</p>
               <h1 className="mt-2 font-display text-3xl font-black text-stone-950">استلام المشتريات</h1>
               <p className="mt-2 text-sm text-stone-600">إدخال سندات الشراء، رفع الأرصدة، وتحديث تكلفة الصنف الأخيرة مباشرة.</p>
+              <div className="mt-4 flex flex-wrap items-center gap-2">
+                <a className="rounded-full border border-teal-200 bg-teal-50 px-4 py-2 text-sm font-black text-teal-800 transition hover:border-teal-400 hover:bg-teal-100" href="#purchase-form-section">نموذج الشراء</a>
+                <a className="rounded-full border border-stone-300 bg-white px-4 py-2 text-sm font-black text-stone-700 transition hover:border-teal-400 hover:text-teal-700" href="#suppliers-section">الموردون</a>
+                <a className="rounded-full border border-stone-300 bg-white px-4 py-2 text-sm font-black text-stone-700 transition hover:border-amber-400 hover:text-amber-700" href="#receipts-section">السندات</a>
+              </div>
             </div>
             <div className="flex flex-wrap items-center gap-3">
               <button className="rounded-full border border-stone-300 px-4 py-2 text-sm font-black text-stone-700 transition hover:border-teal-500 hover:text-teal-700" onClick={exportReceiptsCsv} type="button">تصدير السندات CSV</button>
               <button className="rounded-full border border-stone-300 px-4 py-2 text-sm font-black text-stone-700 transition hover:border-stone-500" onClick={() => void loadPurchasesData()} type="button">تحديث البيانات</button>
               <Link className="rounded-full border border-stone-300 px-4 py-2 text-sm font-black text-stone-700 transition hover:border-teal-500 hover:text-teal-700" to="/inventory">المخزون</Link>
-              <Link className="rounded-full border border-stone-300 px-4 py-2 text-sm font-black text-stone-700 transition hover:border-teal-500 hover:text-teal-700" to="/dashboard">اللوحة</Link>
+              {session?.employee.role === 'admin' ? <Link className="rounded-full border border-stone-300 px-4 py-2 text-sm font-black text-stone-700 transition hover:border-teal-500 hover:text-teal-700" to="/dashboard">اللوحة</Link> : null}
             </div>
           </div>
         </header>
@@ -1104,27 +1367,28 @@ export function PurchasesPage() {
           </article>
         </section>
 
-        {message ? <section className="mt-6 rounded-[24px] border border-teal-300/40 bg-teal-50 px-5 py-4 text-sm font-bold text-teal-800">{message}</section> : null}
+        <FeedbackMessage message={message} onClear={() => setMessage(null)} />
 
-        <section className="mt-6 grid gap-6 xl:grid-cols-[minmax(460px,1.05fr)_minmax(0,0.95fr)] 2xl:grid-cols-[minmax(540px,1.05fr)_minmax(0,0.95fr)]">
-          <section className="self-start rounded-[32px] border border-stone-200/80 bg-[linear-gradient(180deg,#101826_0%,#172436_100%)] p-5 text-white shadow-[0_28px_90px_rgba(17,24,39,0.18)] sm:p-6 xl:sticky xl:top-5">
+        <section className="mt-6 space-y-6">
+          <section className="scroll-mt-8 rounded-[32px] border border-stone-200/80 bg-[linear-gradient(180deg,#101826_0%,#172436_100%)] p-5 text-white shadow-[0_28px_90px_rgba(17,24,39,0.18)] sm:p-6" id="purchase-form-section">
             <p className="text-sm font-black tracking-[0.2em] text-teal-200/80">PURCHASE FORM</p>
-            <h2 className="mt-2 font-display text-3xl font-black">سند استلام شراء جديد</h2>
+            <h2 className="mt-2 font-display text-3xl font-black">{isEditingReceipt ? 'تعديل سند شراء' : 'سند استلام شراء جديد'}</h2>
+            <p className="mt-2 text-sm text-stone-300">{isEditingReceipt ? 'أنت الآن في وضع تعديل سند سابق. سيُعاد احتساب المخزون بعد الحفظ.' : 'أدخل سند شراء جديد ليتم رفع الرصيد وتحديث آخر كلفة للصنف مباشرة.'}</p>
 
-            <form className="mt-5 grid gap-4" onSubmit={handleSubmit}>
-              <div className="grid gap-4 sm:grid-cols-2">
+            <form className="mt-5 grid gap-3" onSubmit={handleSubmit}>
+              <div className="grid gap-3 sm:grid-cols-2">
                 <label className="text-sm font-bold text-stone-200">المورد<select className="mt-2 h-12 w-full rounded-2xl border border-white/10 bg-black/20 px-4 text-right text-base text-white outline-none focus:border-teal-400" value={selectedSupplierId} onChange={(event) => setSelectedSupplierId(event.target.value)}><option value="">بدون ربط بمورد</option>{suppliers.map((supplier) => <option key={supplier.id} value={supplier.id}>{supplier.name}</option>)}</select></label>
                 <label className="text-sm font-bold text-stone-200">العملة<select className="mt-2 h-12 w-full rounded-2xl border border-white/10 bg-black/20 px-4 text-right text-base text-white outline-none focus:border-teal-400" value={currencyCode} onChange={(event) => setCurrencyCode(event.target.value as CurrencyCode)}><option value="IQD">دينار عراقي</option><option value="USD">دولار أمريكي</option></select></label>
               </div>
 
-              <div className="grid gap-4 sm:grid-cols-2 2xl:grid-cols-4">
+              <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
                 <label className="text-sm font-bold text-stone-200">تاريخ الشراء<input className="mt-2 h-12 w-full rounded-2xl border border-white/10 bg-black/20 px-4 text-right text-base text-white outline-none focus:border-teal-400" type="date" value={purchaseDate} onChange={(event) => setPurchaseDate(event.target.value)} /></label>
                 <label className="text-sm font-bold text-stone-200">رقم قائمة المورد<input className="mt-2 h-12 w-full rounded-2xl border border-white/10 bg-black/20 px-4 text-left text-base text-white outline-none placeholder:text-stone-400 focus:border-teal-400" dir="ltr" placeholder="INV-001" value={supplierInvoiceNo} onChange={(event) => setSupplierInvoiceNo(event.target.value)} /></label>
                 <label className="text-sm font-bold text-stone-200">سعر الصرف<input className="mt-2 h-12 w-full rounded-2xl border border-white/10 bg-black/20 px-4 text-right text-base text-white outline-none placeholder:text-stone-400 focus:border-teal-400" step="1" type="number" value={exchangeRate} onChange={(event) => setExchangeRate(event.target.value)} /></label>
                 <label className="text-sm font-bold text-stone-200">ملاحظات<input className="mt-2 h-12 w-full rounded-2xl border border-white/10 bg-black/20 px-4 text-right text-base text-white outline-none placeholder:text-stone-400 focus:border-teal-400" value={notes} onChange={(event) => setNotes(event.target.value)} /></label>
               </div>
 
-              <div className="space-y-4">
+              <div className="space-y-3">
                 {lines.map((line, index) => {
                   const normalizedLine = normalizedLinesWithCosts[index]
                   const retailUnitCostDisplay = normalizedLine?.retailUnitCostIqd !== null && normalizedLine?.retailUnitCostIqd !== undefined
@@ -1132,8 +1396,8 @@ export function PurchasesPage() {
                     : null
 
                   return (
-                  <div key={`${index}-${line.mode}-${line.productId || line.draft.barcode || 'draft'}`} className="rounded-[24px] border border-white/10 bg-black/20 p-4">
-                    <div className="grid gap-4 xl:grid-cols-[minmax(0,1.2fr)_minmax(220px,0.8fr)_auto] xl:items-end">
+                  <div key={`${index}-${line.mode}-${line.productId || line.draft.barcode || 'draft'}`} className="rounded-[24px] border border-white/10 bg-black/20 p-3 sm:p-4">
+                    <div className="grid gap-3 lg:grid-cols-[minmax(0,1.15fr)_minmax(190px,0.85fr)_auto] lg:items-end">
                       <label className="text-sm font-bold text-stone-200">الباركود الحاسم<select className="sr-only"><option>barcode</option></select><input className="mt-2 h-12 w-full rounded-2xl border border-white/10 bg-black/30 px-4 text-left text-base text-white outline-none focus:border-teal-400" dir="ltr" placeholder="اسحب أو أدخل الباركود أولاً" value={line.lookupBarcode} onBlur={(event) => resolveLineBarcode(index, event.target.value)} onChange={(event) => updateLine(index, { lookupBarcode: event.target.value })} onKeyDown={(event) => {
                         if (event.key === 'Enter') {
                           event.preventDefault()
@@ -1147,10 +1411,10 @@ export function PurchasesPage() {
                       <button className="h-12 rounded-2xl border border-white/20 px-4 text-sm font-black text-white transition hover:border-white/40" onClick={() => resolveLineBarcode(index, line.lookupBarcode)} type="button">فحص الباركود</button>
                     </div>
 
-                    <div className="mt-4 space-y-4">
+                    <div className="mt-3 space-y-3">
                       <div>
                         <p className="text-sm font-bold text-stone-200">نوع السطر</p>
-                        <div className="mt-2 grid gap-3 sm:grid-cols-2">
+                        <div className="mt-2 grid gap-2 sm:grid-cols-2">
                           <button
                             className={`rounded-2xl border px-4 py-3 text-sm font-black transition ${line.mode === 'existing' ? 'border-teal-300 bg-teal-500/15 text-white' : 'border-white/10 bg-black/20 text-stone-300 hover:border-white/25 hover:text-white'}`}
                             onClick={() => {
@@ -1183,10 +1447,10 @@ export function PurchasesPage() {
                         </div>
                       </div>
 
-                      <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-12 2xl:items-end">
+                      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3 2xl:grid-cols-12 2xl:items-end">
 
                         {line.mode === 'existing' ? (
-                          <label className="text-sm font-bold text-stone-200 md:col-span-2 2xl:col-span-4">الصنف<select className="mt-2 h-12 w-full rounded-2xl border border-white/10 bg-black/30 px-4 text-right text-base text-white outline-none focus:border-teal-400" value={line.productId} onChange={(event) => {
+                          <label className="text-sm font-bold text-stone-200 md:col-span-2 xl:col-span-3 2xl:col-span-4">الصنف<select className="mt-2 h-12 w-full rounded-2xl border border-white/10 bg-black/30 px-4 text-right text-base text-white outline-none focus:border-teal-400" value={line.productId} onChange={(event) => {
                             const nextProduct = products.find((product) => product.id === event.target.value) ?? null
                             updateLine(index, {
                               productId: event.target.value,
@@ -1195,12 +1459,61 @@ export function PurchasesPage() {
                             })
                           }}><option value="">اختر صنفاً</option>{products.map((product) => <option key={product.id} value={product.id}>{product.name}</option>)}</select></label>
                         ) : (
-                          <div className="grid gap-4 md:col-span-2 2xl:col-span-4">
-                            <label className="text-sm font-bold text-stone-200">اسم الصنف<input className="mt-2 h-12 w-full rounded-2xl border border-white/10 bg-black/30 px-4 text-right text-base text-white outline-none focus:border-teal-400" value={line.draft.name} onChange={(event) => updateLineDraft(index, { name: event.target.value })} /></label>
+                          <div className="grid gap-3 md:col-span-2 xl:col-span-3 2xl:col-span-4">
+                            {(() => {
+                              const familyProfile = getFamilyProfileByName(line.draft.name)
+                              const variantSuggestions = getVariantSuggestions(line.draft.name)
+
+                              return (
+                                <>
+                                  <label className="text-sm font-bold text-stone-200">
+                                    اسم المنتج الرئيسي
+                                    <SuggestionInput
+                                      emptyStateClassName="px-4 py-3 text-right text-xs font-bold text-stone-400"
+                                      inputClassName="h-12 w-full rounded-2xl border border-white/10 bg-black/30 px-4 text-right text-base text-white outline-none focus:border-teal-400"
+                                      optionClassName="w-full px-4 py-3 text-right text-sm font-bold text-stone-100 transition hover:bg-teal-500/20 hover:text-teal-100"
+                                      panelClassName="absolute left-0 right-0 top-full z-20 mt-2 overflow-hidden rounded-2xl border border-white/10 bg-slate-950/95 shadow-[0_24px_80px_rgba(15,23,42,0.55)] backdrop-blur"
+                                      placeholder="ابدأ بكتابة اسم مثل جل أو شاي"
+                                      suggestions={getFamilySuggestionOptions()}
+                                      value={line.draft.name}
+                                      onChange={(nextValue) => handleDraftFamilyNameChange(index, nextValue)}
+                                    />
+                                    {familyProfile ? <span className="mt-2 block text-xs font-black text-teal-200">تم العثور على عائلة محفوظة سابقاً وسيتم إعادة استخدام القسم والوحدات والضريبة الخاصة بها.</span> : <span className="mt-2 block text-xs font-bold text-stone-400">إذا كان هذا المنتج الرئيسي مُدخلاً سابقاً فسيظهر لك ضمن الاقتراحات أثناء الكتابة.</span>}
+                                  </label>
+                                  <label className="text-sm font-bold text-stone-200">
+                                    الصنف الفرعي / النكهة / اللون
+                                    <SuggestionInput
+                                      emptyStateClassName="px-4 py-3 text-right text-xs font-bold text-stone-400"
+                                      inputClassName="h-12 w-full rounded-2xl border border-white/10 bg-black/30 px-4 text-right text-base text-white outline-none focus:border-teal-400"
+                                      optionClassName="w-full px-4 py-3 text-right text-sm font-bold text-stone-100 transition hover:bg-teal-500/20 hover:text-teal-100"
+                                      panelClassName="absolute left-0 right-0 top-full z-20 mt-2 overflow-hidden rounded-2xl border border-white/10 bg-slate-950/95 shadow-[0_24px_80px_rgba(15,23,42,0.55)] backdrop-blur"
+                                      placeholder="مثال: ياسمين أو ورد"
+                                      suggestions={getVariantSuggestionOptions(line.draft.name)}
+                                      value={line.draft.variantLabel}
+                                      onChange={(nextValue) => updateLineDraft(index, { variantLabel: nextValue })}
+                                    />
+                                    {variantSuggestions.length ? <span className="mt-2 block text-xs font-black text-teal-200">أصناف فرعية محفوظة لهذه العائلة: {variantSuggestions.join('، ')}</span> : <span className="mt-2 block text-xs font-bold text-stone-400">عند اختيار عائلة موجودة ستظهر لك الأصناف الفرعية السابقة لهذه العائلة.</span>}
+                                  </label>
+                                </>
+                              )
+                            })()}
+                            <div className="rounded-2xl border border-white/10 bg-black/20 px-4 py-3 text-sm font-bold text-stone-200">
+                              اسم الـ SKU الناتج: {getDraftDisplayName(line.draft)}
+                            </div>
                           </div>
                         )}
 
-                        {line.mode === 'new' ? <label className="text-sm font-bold text-stone-200 2xl:col-span-2">القسم<input className="mt-2 h-12 w-full rounded-2xl border border-white/10 bg-black/30 px-4 text-right text-base text-white outline-none focus:border-teal-400" value={line.draft.department} onChange={(event) => updateLineDraft(index, { department: event.target.value })} /></label> : null}
+                        {line.mode === 'new' ? <label className="text-sm font-bold text-stone-200 2xl:col-span-2">القسم<SuggestionInput
+                          emptyStateClassName="px-4 py-3 text-right text-xs font-bold text-stone-400"
+                          inputClassName="h-12 w-full rounded-2xl border border-white/10 bg-black/30 px-4 text-right text-base text-white outline-none focus:border-teal-400"
+                          optionClassName="w-full border-b border-white/5 px-4 py-3 text-right text-sm font-bold text-stone-100 transition last:border-b-0 hover:bg-teal-500/20 hover:text-teal-100"
+                          panelClassName="absolute right-0 top-full z-20 mt-2 min-w-[280px] max-w-[360px] overflow-hidden rounded-2xl border border-white/10 bg-slate-950/95 shadow-[0_24px_80px_rgba(15,23,42,0.55)] backdrop-blur"
+                          placeholder="اختر قسماً موجوداً أو اكتب قسماً جديداً"
+                          suggestions={getDepartmentSuggestionOptions()}
+                          value={line.draft.department}
+                          onChange={(nextValue) => updateLineDraft(index, { department: nextValue })}
+                        />
+                        <span className="mt-2 block text-xs font-bold text-stone-400">ستظهر هنا الأقسام المستخدمة سابقاً لتوحيد الإدخال وتقليل اختلاف المسميات.</span></label> : null}
 
                         {line.mode === 'new' ? <label className="text-sm font-bold text-stone-200 2xl:col-span-2">نوع الصنف<select className="mt-2 h-12 w-full rounded-2xl border border-white/10 bg-black/30 px-4 text-right text-base text-white outline-none focus:border-teal-400" value={line.draft.measurementType} onChange={(event) => {
                           const nextMeasurementType = event.target.value as 'unit' | 'weight'
@@ -1235,13 +1548,13 @@ export function PurchasesPage() {
                       </div>
                     </div>
 
-                    <div className="mt-4 flex justify-end">
+                    <div className="mt-3 flex justify-end">
                       <button className="min-w-32 rounded-2xl border border-rose-300 px-4 py-3 text-sm font-black text-rose-200 transition hover:border-rose-200 hover:text-white disabled:opacity-40" disabled={lines.length === 1} onClick={() => removeLine(index)} type="button">حذف السطر</button>
                     </div>
 
                     {line.mode === 'new' ? (
-                      <div className="mt-4 space-y-4">
-                        <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
+                      <div className="mt-3 space-y-3">
+                        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
                           <label className="text-sm font-bold text-stone-200">باركود المفرد<input className="mt-2 h-12 w-full rounded-2xl border border-white/10 bg-black/30 px-4 text-left text-base text-white outline-none focus:border-teal-400" dir="ltr" value={line.draft.barcode} onChange={(event) => {
                             updateLine(index, { lookupBarcode: event.target.value })
                             updateLineDraft(index, { barcode: event.target.value })
@@ -1250,13 +1563,13 @@ export function PurchasesPage() {
                           <label className="text-sm font-bold text-stone-200">رمز PLU<input className="mt-2 h-12 w-full rounded-2xl border border-white/10 bg-black/30 px-4 text-left text-base text-white outline-none focus:border-teal-400" dir="ltr" value={line.draft.plu} onChange={(event) => updateLineDraft(index, { plu: event.target.value })} /></label>
                         </div>
 
-                        <div className="grid gap-4 md:grid-cols-2 2xl:grid-cols-3">
+                        <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
                           <label className="text-sm font-bold text-stone-200">وحدة المفرد<select className="mt-2 h-12 w-full rounded-2xl border border-white/10 bg-black/30 px-4 text-right text-base text-white outline-none focus:border-teal-400" value={line.draft.retailUnit} onChange={(event) => updateLineDraft(index, { retailUnit: event.target.value })}>{getRetailUnitOptions(line.draft.measurementType).map((unit) => <option key={unit} value={unit}>{unit}</option>)}</select></label>
                           <label className="text-sm font-bold text-stone-200">وحدة الجملة<select className="mt-2 h-12 w-full rounded-2xl border border-white/10 bg-black/30 px-4 text-right text-base text-white outline-none focus:border-teal-400" value={line.draft.wholesaleUnit} onChange={(event) => updateLineDraft(index, { wholesaleUnit: event.target.value })}>{getWholesaleUnitOptions(line.draft.measurementType).map((unit) => <option key={unit} value={unit}>{unit}</option>)}</select></label>
                           <label className="text-sm font-bold text-stone-200">عدد المفردات داخل وحدة الجملة<input className="mt-2 h-12 w-full rounded-2xl border border-white/10 bg-black/30 px-4 text-right text-base text-white outline-none focus:border-teal-400" step="1" type="number" value={line.draft.wholesaleQuantity} onChange={(event) => updateLineDraft(index, { wholesaleQuantity: event.target.value })} /></label>
                         </div>
 
-                        <div className="grid gap-4 md:grid-cols-[1fr_220px]">
+                        <div className="grid gap-3 lg:grid-cols-[minmax(0,1fr)_220px]">
                           <div className="rounded-2xl border border-white/10 bg-black/20 px-4 py-4 text-sm font-bold text-stone-200">
                             {supportsDraftWholesale(line.draft)
                               ? <>
@@ -1287,8 +1600,8 @@ export function PurchasesPage() {
                     })() : (
                       <p className="mt-3 text-xs font-bold text-stone-300">
                         {supportsDraftWholesale(line.draft)
-                          ? `كل ${line.draft.wholesaleUnit} تحتوي ${line.draft.wholesaleQuantity} ${line.draft.retailUnit || 'وحدة مفرد'}. عند شراء الجملة سيتم احتساب كلفة المفرد تلقائياً وحفظ الباركودين مع الصنف.`
-                          : `يمكنك إدخال الصنف الجديد من هذا السند مباشرة. إذا أضفت تعبئة جملة فأدخل وحدة الجملة وعدد المفردات وباركود الجملة.`}
+                          ? `كل ${line.draft.wholesaleUnit} تحتوي ${line.draft.wholesaleQuantity} ${line.draft.retailUnit || 'وحدة مفرد'}. سيتم حفظ ${getDraftDisplayName(line.draft)} كـ SKU مستقل تحت المنتج الرئيسي المدخل.`
+                          : `يمكنك إدخال SKU جديد من هذا السند مباشرة. أدخل اسم المنتج الرئيسي ثم الصنف الفرعي مثل النكهة أو اللون، وإذا أضفت تعبئة جملة فأدخل وحدة الجملة وعدد المفردات وباركود الجملة.`}
                       </p>
                     )}
                   </div>
@@ -1297,13 +1610,13 @@ export function PurchasesPage() {
 
               <div className="flex flex-wrap items-center gap-3">
                 <button className="rounded-2xl border border-white/20 px-4 py-3 text-base font-black text-white transition hover:border-white/40" onClick={addLine} type="button">إضافة سطر جديد</button>
-                <button className="rounded-2xl bg-emerald-500 px-4 py-3 text-base font-black text-white transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-emerald-300" disabled={isSubmitting || isLoading} type="submit">{isSubmitting ? 'جارٍ حفظ السند...' : 'تثبيت سند الشراء'}</button>
+                {isEditingReceipt ? <button className="rounded-2xl border border-amber-300 px-4 py-3 text-base font-black text-amber-100 transition hover:border-amber-200 hover:text-white" onClick={resetPurchaseForm} type="button">إلغاء التعديل</button> : null}
+                <button className="rounded-2xl bg-emerald-500 px-4 py-3 text-base font-black text-white transition hover:bg-emerald-400 disabled:cursor-not-allowed disabled:bg-emerald-300" disabled={isSubmitting || isLoading} type="submit">{isSubmitting ? (isEditingReceipt ? 'جارٍ تعديل السند...' : 'جارٍ حفظ السند...') : (isEditingReceipt ? 'حفظ التعديلات' : 'تثبيت سند الشراء')}</button>
               </div>
             </form>
           </section>
 
-          <section className="space-y-6">
-            <section className="rounded-[32px] border border-white/70 bg-white/82 p-5 shadow-[0_24px_80px_rgba(77,60,27,0.10)] backdrop-blur-xl sm:p-6">
+            <section className="scroll-mt-8 rounded-[32px] border border-white/70 bg-white/82 p-5 shadow-[0_24px_80px_rgba(77,60,27,0.10)] backdrop-blur-xl sm:p-6" id="suppliers-section">
               <div className="flex items-start justify-between gap-4">
                 <div>
                   <p className="text-sm font-black tracking-[0.2em] text-teal-700">SUPPLIERS</p>
@@ -1366,12 +1679,14 @@ export function PurchasesPage() {
                   </div>
 
                   <form className="mt-5 grid gap-4" onSubmit={handleSupplierPaymentSubmit}>
-                    <div className="grid gap-4 sm:grid-cols-2 2xl:grid-cols-4">
+                    <div className="grid gap-4 md:grid-cols-2">
                       <label className="text-sm font-bold text-stone-700">العملة<select className="mt-2 h-12 w-full rounded-2xl border border-stone-200 bg-white px-4 text-right text-base text-stone-900 outline-none focus:border-amber-500" value={paymentCurrencyCode} onChange={(event) => setPaymentCurrencyCode(event.target.value as CurrencyCode)}><option value="IQD">دينار عراقي</option><option value="USD">دولار أمريكي</option></select></label>
                       <label className="text-sm font-bold text-stone-700">سعر الصرف<input className="mt-2 h-12 w-full rounded-2xl border border-stone-200 bg-white px-4 text-right text-base text-stone-900 outline-none focus:border-amber-500" step="1" type="number" value={paymentExchangeRate} onChange={(event) => setPaymentExchangeRate(event.target.value)} /></label>
                       <label className="text-sm font-bold text-stone-700">قيمة الدفعة<input className="mt-2 h-12 w-full rounded-2xl border border-stone-200 bg-white px-4 text-right text-base text-stone-900 outline-none focus:border-amber-500" step="0.01" type="number" value={paymentAmount} onChange={(event) => setPaymentAmount(event.target.value)} /></label>
                       <label className="text-sm font-bold text-stone-700">ما يعادلها بالدينار<input className="mt-2 h-12 w-full rounded-2xl border border-stone-200 bg-stone-100 px-4 text-right text-base font-black text-stone-900 outline-none" readOnly value={paymentAmountIqd ? formatMoney(paymentAmountIqd, 'IQD') : ''} /></label>
                     </div>
+
+                    <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-bold text-amber-900">سيتم تسديد دفعة المورد تلقائياً من FINAL CASH بحسب الرصيد النقدي النهائي المتاح.</div>
 
                     <label className="text-sm font-bold text-stone-700">ملاحظات الدفعة<input className="mt-2 h-12 w-full rounded-2xl border border-stone-200 bg-white px-4 text-right text-base text-stone-900 outline-none focus:border-amber-500" value={paymentNotes} onChange={(event) => setPaymentNotes(event.target.value)} /></label>
 
@@ -1388,7 +1703,7 @@ export function PurchasesPage() {
                         <div className="flex items-start justify-between gap-3">
                           <div>
                             <p className="font-display text-lg font-black text-stone-950">{payment.paymentNo}</p>
-                            <p className="mt-1 text-sm text-stone-600">{formatDate(payment.createdAt)}{payment.notes ? ` | ${payment.notes}` : ''}</p>
+                            <p className="mt-1 text-sm text-stone-600">{formatDate(payment.createdAt)}{payment.sourceFundAccountName ? ` | من ${payment.sourceFundAccountName}` : ''}{payment.notes ? ` | ${payment.notes}` : ''}</p>
                           </div>
                           <div className="text-left">
                             <p className="font-display text-xl font-black text-emerald-700">{formatMoney(payment.amountIqd, 'IQD')}</p>
@@ -1445,7 +1760,7 @@ export function PurchasesPage() {
                       <h5 className="text-sm font-black tracking-[0.18em] text-stone-500">الحركات المحاسبية</h5>
                       {filteredSupplierLedger.length === 0 ? <div className="rounded-2xl bg-white/90 px-4 py-6 text-center text-stone-500">لا توجد حركات مطابقة للفلاتر الحالية.</div> : filteredSupplierLedgerGroups.map((group) => (
                         <section key={group.key} className="overflow-hidden rounded-[26px] border border-stone-200 bg-white/70 p-4 shadow-sm xl:p-5">
-                          <div className="flex flex-col gap-3 border-b border-stone-200/80 pb-4 xl:flex-row xl:items-center xl:justify-between">
+                          <div className="border-b border-stone-200/80 pb-4">
                             <div>
                               <div className="flex flex-wrap items-center gap-2">
                                 <span className={`rounded-full px-3 py-1 text-xs font-black ${group.type === 'invoice' ? 'bg-amber-100 text-amber-800' : 'bg-emerald-100 text-emerald-800'}`}>
@@ -1460,7 +1775,7 @@ export function PurchasesPage() {
                               </p>
                             </div>
 
-                            <div className="grid w-full gap-3 sm:grid-cols-2 xl:w-auto xl:grid-cols-3 xl:min-w-[420px]">
+                            <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-3">
                               <div className="rounded-2xl bg-amber-50 px-4 py-3">
                                 <p className="text-xs font-black tracking-[0.16em] text-amber-800">مدين</p>
                                 <p className="mt-2 font-display text-xl font-black text-amber-700">{formatMoney(group.totalDebitIqd, 'IQD')}</p>
@@ -1479,8 +1794,7 @@ export function PurchasesPage() {
                           <div className="mt-4 space-y-3">
                             {group.entries.map((entry) => (
                               <article key={`${entry.type}-${entry.id}`} className={`rounded-2xl border bg-white/90 px-4 py-4 shadow-sm transition ${entry.type === 'receipt' ? 'cursor-pointer hover:border-amber-300' : ''} ${entry.type === 'receipt' && selectedReceiptId === entry.receipt.id ? 'border-amber-400' : 'border-stone-200'}`} onClick={entry.type === 'receipt' ? () => setSelectedReceiptId(entry.receipt.id) : undefined}>
-                                <div className="flex flex-col gap-4 xl:flex-row xl:items-start xl:justify-between">
-                                  <div className="min-w-0 xl:flex-1">
+                                <div className="min-w-0">
                                     <div className="flex flex-wrap items-center gap-2">
                                       <span className={`rounded-full px-3 py-1 text-xs font-black ${entry.type === 'receipt' ? 'bg-amber-100 text-amber-800' : 'bg-emerald-100 text-emerald-800'}`}>
                                         {entry.type === 'receipt' ? 'سند شراء' : 'دفعة مورد'}
@@ -1500,9 +1814,9 @@ export function PurchasesPage() {
                                         <p className="mt-2 text-sm text-stone-500">{entry.payment.notes ? entry.payment.notes : 'دفعة مسجلة بدون ملاحظات.'}</p>
                                       </>
                                     )}
-                                  </div>
+                                </div>
 
-                                  <div className="grid w-full gap-3 text-left sm:grid-cols-2 2xl:grid-cols-4 xl:w-auto xl:min-w-[420px] 2xl:min-w-[560px]">
+                                <div className="mt-4 grid gap-3 text-left sm:grid-cols-2 xl:grid-cols-4">
                                     <div className="rounded-2xl bg-stone-50 px-4 py-3">
                                       <p className="text-xs font-black tracking-[0.16em] text-stone-500">الحركة</p>
                                       <p className={`mt-2 font-display text-xl font-black ${entry.deltaIqd >= 0 ? 'text-amber-700' : 'text-emerald-700'}`}>
@@ -1526,7 +1840,6 @@ export function PurchasesPage() {
                                       <p className="text-xs font-black tracking-[0.16em] text-stone-500">الرصيد بعد الحركة</p>
                                       <p className={`mt-2 font-display text-xl font-black ${entry.runningBalanceIqd > 0 ? 'text-rose-700' : entry.runningBalanceIqd < 0 ? 'text-emerald-700' : 'text-stone-950'}`}>{formatMoney(entry.runningBalanceIqd, 'IQD')}</p>
                                     </div>
-                                  </div>
                                 </div>
                               </article>
                             ))}
@@ -1539,7 +1852,7 @@ export function PurchasesPage() {
               ) : null}
             </section>
 
-            <section className="rounded-[32px] border border-white/70 bg-white/82 p-5 shadow-[0_24px_80px_rgba(77,60,27,0.10)] backdrop-blur-xl sm:p-6">
+            <section className="scroll-mt-8 rounded-[32px] border border-white/70 bg-white/82 p-5 shadow-[0_24px_80px_rgba(77,60,27,0.10)] backdrop-blur-xl sm:p-6" id="receipts-section">
               <p className="text-sm font-black tracking-[0.2em] text-amber-700">RECEIPTS</p>
               <h2 className="mt-2 font-display text-3xl font-black text-stone-950">آخر سندات الشراء</h2>
 
@@ -1570,6 +1883,8 @@ export function PurchasesPage() {
                       <p className="mt-2 text-sm text-stone-600">اضغط على أي سند لعرض تفاصيله الكاملة ثم اطبعه مباشرة.</p>
                     </div>
                     <div className="flex flex-wrap items-center gap-3">
+                        <button className="rounded-2xl border border-amber-300 px-4 py-3 text-sm font-black text-amber-700 transition hover:border-amber-400 hover:bg-amber-50" disabled={isSubmitting} onClick={() => handleEditReceipt(selectedReceipt)} type="button">تعديل السند</button>
+                        <button className="rounded-2xl border border-rose-300 px-4 py-3 text-sm font-black text-rose-700 transition hover:border-rose-400 hover:bg-rose-50" disabled={isSubmitting} onClick={() => void handleDeleteReceipt(selectedReceipt)} type="button">حذف السند</button>
                       <button className="rounded-2xl bg-teal-700 px-4 py-3 text-sm font-black text-white transition hover:bg-teal-600" onClick={() => printReceipt(selectedReceipt)} type="button">طباعة السند</button>
                       <button className="rounded-2xl border border-stone-300 px-4 py-3 text-sm font-black text-stone-700 transition hover:border-stone-500" onClick={() => setSelectedReceiptId(null)} type="button">إغلاق التفاصيل</button>
                     </div>
@@ -1625,10 +1940,13 @@ export function PurchasesPage() {
                   </div>
                 </section>
               ) : null}
-            </section>
           </section>
         </section>
       </div>
     </main>
   )
+}
+
+function getDraftDisplayName(draft: ProductDraftState) {
+  return buildProductDisplayName(draft.name.trim() || 'منتج رئيسي', draft.variantLabel.trim() || undefined)
 }

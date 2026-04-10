@@ -1,21 +1,24 @@
-const storedSuppliers = [
-    {
-        id: 'supp-nahrain',
-        name: 'شركة النهرين للتجهيز',
-        phone: '07700000001',
-        currentBalance: 0,
-        isActive: true,
-        createdAt: new Date().toISOString(),
-    },
-    {
-        id: 'supp-baghdad-foods',
-        name: 'بغداد فودز',
-        phone: '07700000002',
-        currentBalance: 0,
-        isActive: true,
-        createdAt: new Date().toISOString(),
-    },
-];
+function createDefaultSuppliers() {
+    return [
+        {
+            id: 'supp-nahrain',
+            name: 'شركة النهرين للتجهيز',
+            phone: '07700000001',
+            currentBalance: 0,
+            isActive: true,
+            createdAt: new Date().toISOString(),
+        },
+        {
+            id: 'supp-baghdad-foods',
+            name: 'بغداد فودز',
+            phone: '07700000002',
+            currentBalance: 0,
+            isActive: true,
+            createdAt: new Date().toISOString(),
+        },
+    ];
+}
+const storedSuppliers = createDefaultSuppliers();
 const storedSupplierPayments = [];
 function createSupplierId() {
     if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -106,9 +109,15 @@ export function createSupplierPayment(input) {
         exchangeRate: input.exchangeRate,
         amount: roundMoney(input.amount),
         amountIqd: roundMoney(input.amountIqd),
+        sourceFundAccountId: input.sourceFundAccountId,
+        sourceFundAccountName: input.sourceFundAccountName,
         notes: input.notes?.trim() || undefined,
         createdAt: new Date().toISOString(),
     };
     storedSupplierPayments.unshift(payment);
     return { ...payment };
+}
+export function resetSuppliersStore() {
+    storedSuppliers.splice(0, storedSuppliers.length, ...createDefaultSuppliers());
+    storedSupplierPayments.splice(0, storedSupplierPayments.length);
 }

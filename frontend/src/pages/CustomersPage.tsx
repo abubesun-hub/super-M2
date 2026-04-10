@@ -1,5 +1,7 @@
 import { useEffect, useState } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
+import { FeedbackMessage } from '../components/FeedbackMessage'
+import { getUserFacingErrorMessage } from '../lib/user-facing-errors'
 import { formatMoney, IQD_PER_USD, type CurrencyCode } from '../lib/currency'
 import { exportRowsToCsv } from '../lib/export'
 import {
@@ -105,10 +107,6 @@ function getPaymentTypeLabel(paymentType: StoredSaleInvoice['paymentType']) {
     return 'آجل'
   }
 
-  if (paymentType === 'partial') {
-    return 'جزئي'
-  }
-
   return 'نقدي'
 }
 
@@ -171,9 +169,12 @@ function buildCustomerLedgerEntries(customerInvoices: StoredSaleInvoice[], custo
     title: `تسديد ${payment.paymentNo}`,
     debitIqd: 0,
     creditIqd: payment.amountIqd,
-    subtitle: payment.currencyCode === 'USD'
-      ? `${new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(payment.amount)} - سعر الصرف ${payment.exchangeRate}`
-      : 'تسديد بالدينار العراقي',
+    subtitle: [
+      payment.currencyCode === 'USD'
+        ? `${new Intl.NumberFormat('en-US', { style: 'currency', currency: 'USD' }).format(payment.amount)} - سعر الصرف ${payment.exchangeRate}`
+        : 'تسديد بالدينار العراقي',
+      payment.destinationFundAccountName ? `أودع في ${payment.destinationFundAccountName}` : null,
+    ].filter(Boolean).join(' | '),
     notes: payment.notes,
     payment,
   }))
@@ -323,7 +324,7 @@ export function CustomersPage() {
         setMessage(null)
       }
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'تعذر تحميل العملاء.')
+      setMessage(getUserFacingErrorMessage(error, 'تعذر تحميل العملاء.'))
     } finally {
       setIsLoading(false)
     }
@@ -357,7 +358,7 @@ export function CustomersPage() {
         }
       } catch (error) {
         if (!cancelled) {
-          setMessage(error instanceof Error ? error.message : 'تعذر تحميل تسديدات العميل.')
+          setMessage(getUserFacingErrorMessage(error, 'تعذر تحميل تسديدات العميل.'))
           setPayments([])
         }
       } finally {
@@ -425,7 +426,7 @@ export function CustomersPage() {
         setMessage(`تم إنشاء العميل ${createdCustomer.name} بنجاح.`)
       }
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'تعذر حفظ بيانات العميل.')
+      setMessage(getUserFacingErrorMessage(error, 'تعذر حفظ بيانات العميل.'))
     } finally {
       setIsSavingCustomer(false)
     }
@@ -450,7 +451,7 @@ export function CustomersPage() {
       setPayments([])
       setMessage(`تم حذف العميل ${selectedCustomer.name}.`)
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'تعذر حذف العميل.')
+      setMessage(getUserFacingErrorMessage(error, 'تعذر حذف العميل.'))
     } finally {
       setIsDeletingCustomer(false)
     }
@@ -490,7 +491,7 @@ export function CustomersPage() {
       }))
       setMessage(`تم تسجيل تسديد جديد للعميل ${selectedCustomer.name}.`)
     } catch (error) {
-      setMessage(error instanceof Error ? error.message : 'تعذر تسجيل التسديد.')
+      setMessage(getUserFacingErrorMessage(error, 'تعذر تسجيل التسديد.'))
     } finally {
       setIsSavingPayment(false)
     }
@@ -719,11 +720,7 @@ export function CustomersPage() {
           </article>
         </section>
 
-        {message ? (
-          <section className="mt-6 rounded-[24px] border border-teal-300/40 bg-teal-50 px-5 py-4 text-sm font-bold text-teal-800">
-            {message}
-          </section>
-        ) : null}
+        <FeedbackMessage message={message} onClear={() => setMessage(null)} />
 
         <section className="mt-6 grid gap-6 xl:grid-cols-[0.9fr_1.1fr]">
           <div className="space-y-6">
@@ -996,6 +993,7 @@ export function CustomersPage() {
                         value={paymentForm.notes}
                         onChange={(event) => setPaymentForm((current) => ({ ...current, notes: event.target.value }))}
                       />
+                      <p className="mt-2 text-xs text-stone-400">إذا سُجل التسديد أثناء وردية مفتوحة فسيُحتسب ضمن نقدية الوردية ويظهر في غلقها. أما خارج الوردية فيُرحّل مباشرة إلى صندوق الإيرادات.</p>
                     </label>
 
                     <button
@@ -1023,6 +1021,8 @@ export function CustomersPage() {
                             <div>
                               <p className="font-bold text-white">{payment.paymentNo}</p>
                               <p className="mt-1 text-xs text-stone-300">{formatDate(payment.createdAt)}</p>
+                              {payment.shiftId ? <p className="mt-2 text-xs font-bold text-amber-200">مربوط بورديّة مفتوحة{payment.terminalName ? ` | الجهاز: ${payment.terminalName}` : ''}</p> : null}
+                              {payment.destinationFundAccountName ? <p className="mt-2 text-xs font-bold text-teal-200">الصندوق المستلم: {payment.destinationFundAccountName}</p> : null}
                               {payment.notes ? <p className="mt-2 text-sm text-stone-200">{payment.notes}</p> : null}
                             </div>
                             <div className="text-left">

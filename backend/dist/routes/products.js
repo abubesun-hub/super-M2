@@ -1,7 +1,12 @@
 import { Router } from 'express';
 import { z, ZodError } from 'zod';
 import { getDataAccess } from '../data/index.js';
+import { requireEmployeePermission } from '../middleware/employee-auth.js';
+import { sendOperationError, sendValidationError } from './error-response.js';
 export const productsRouter = Router();
+function getSingleParam(value) {
+    return Array.isArray(value) ? value[0] : value;
+}
 const stockAdjustmentSchema = z.object({
     productId: z.string().min(1),
     quantityDelta: z.number().refine((value) => value !== 0, {
@@ -11,6 +16,8 @@ const stockAdjustmentSchema = z.object({
 });
 const productUpsertSchema = z.object({
     name: z.string().min(3).max(200),
+    productFamilyName: z.string().min(3).max(200).optional().or(z.literal('')),
+    variantLabel: z.string().max(120).optional().or(z.literal('')),
     barcode: z.string().min(3).max(50),
     wholesaleBarcode: z.string().min(3).max(50).optional().or(z.literal('')),
     plu: z.string().max(10).optional().or(z.literal('')),
@@ -71,18 +78,52 @@ productsRouter.get('/', async (_request, response) => {
         data: await dataAccess.products.listProducts(),
     });
 });
-productsRouter.get('/movements', async (_request, response) => {
+productsRouter.get('/price-check', async (_request, response) => {
+    const dataAccess = getDataAccess();
+    const products = await dataAccess.products.listProducts();
+    response.json({
+        data: products.map((product) => ({
+            id: product.id,
+            name: product.name,
+            productFamilyName: product.productFamilyName,
+            variantLabel: product.variantLabel,
+            barcode: product.barcode,
+            wholesaleBarcode: product.wholesaleBarcode,
+            plu: product.plu,
+            department: product.department,
+            measurementType: product.measurementType,
+            retailUnit: product.retailUnit,
+            wholesaleUnit: product.wholesaleUnit,
+            wholesaleQuantity: product.wholesaleQuantity,
+            retailSalePrice: product.retailSalePrice,
+            wholesaleSalePrice: product.wholesaleSalePrice,
+            unitLabel: product.unitLabel,
+        })),
+    });
+});
+productsRouter.get('/movements', requireEmployeePermission('inventory', ['admin', 'inventory']), async (_request, response) => {
     const dataAccess = getDataAccess();
     response.json({
         data: await dataAccess.products.listMovements(),
     });
 });
-productsRouter.post('/', async (request, response) => {
+productsRouter.get('/batches', requireEmployeePermission('batches', ['admin', 'inventory']), async (request, response) => {
+    const dataAccess = getDataAccess();
+    const productId = typeof request.query.productId === 'string' && request.query.productId.trim().length > 0
+        ? request.query.productId.trim()
+        : undefined;
+    response.json({
+        data: await dataAccess.products.listBatches(productId),
+    });
+});
+productsRouter.post('/', requireEmployeePermission('inventory', ['admin', 'inventory']), async (request, response) => {
     try {
         const dataAccess = getDataAccess();
         const payload = productUpsertSchema.parse(request.body);
         const product = await dataAccess.products.createProduct({
             ...payload,
+            productFamilyName: payload.productFamilyName || undefined,
+            variantLabel: payload.variantLabel || undefined,
             wholesaleBarcode: payload.wholesaleBarcode || undefined,
             plu: payload.plu || undefined,
             wholesaleUnit: payload.wholesaleUnit || undefined,
@@ -93,23 +134,21 @@ productsRouter.post('/', async (request, response) => {
     }
     catch (error) {
         if (error instanceof ZodError) {
-            response.status(400).json({
-                message: 'بيانات الصنف الجديد غير صالحة.',
-                issues: error.issues,
-            });
+            sendValidationError(response, 'بيانات الصنف الجديد غير صالحة.', error.issues);
             return;
         }
-        response.status(400).json({
-            message: error instanceof Error ? error.message : 'تعذر إنشاء الصنف.',
-        });
+        sendOperationError(response, error, 'تعذر إنشاء الصنف.');
     }
 });
-productsRouter.put('/:productId', async (request, response) => {
+productsRouter.put('/:productId', requireEmployeePermission('inventory', ['admin', 'inventory']), async (request, response) => {
     try {
         const dataAccess = getDataAccess();
         const payload = productUpsertSchema.parse(request.body);
-        const product = await dataAccess.products.updateProduct(request.params.productId, {
+        const productId = getSingleParam(request.params.productId);
+        const product = await dataAccess.products.updateProduct(productId, {
             ...payload,
+            productFamilyName: payload.productFamilyName || undefined,
+            variantLabel: payload.variantLabel || undefined,
             wholesaleBarcode: payload.wholesaleBarcode || undefined,
             plu: payload.plu || undefined,
             wholesaleUnit: payload.wholesaleUnit || undefined,
@@ -120,32 +159,26 @@ productsRouter.put('/:productId', async (request, response) => {
     }
     catch (error) {
         if (error instanceof ZodError) {
-            response.status(400).json({
-                message: 'بيانات تعديل الصنف غير صالحة.',
-                issues: error.issues,
-            });
+            sendValidationError(response, 'بيانات تعديل الصنف غير صالحة.', error.issues);
             return;
         }
-        response.status(400).json({
-            message: error instanceof Error ? error.message : 'تعذر تعديل الصنف.',
-        });
+        sendOperationError(response, error, 'تعذر تعديل الصنف.');
     }
 });
-productsRouter.delete('/:productId', async (request, response) => {
+productsRouter.delete('/:productId', requireEmployeePermission('inventory', ['admin', 'inventory']), async (request, response) => {
     try {
         const dataAccess = getDataAccess();
-        const product = await dataAccess.products.deleteProduct(request.params.productId);
+        const productId = getSingleParam(request.params.productId);
+        const product = await dataAccess.products.deleteProduct(productId);
         response.json({
             data: product,
         });
     }
     catch (error) {
-        response.status(400).json({
-            message: error instanceof Error ? error.message : 'تعذر حذف الصنف.',
-        });
+        sendOperationError(response, error, 'تعذر حذف الصنف.');
     }
 });
-productsRouter.post('/adjustments', async (request, response) => {
+productsRouter.post('/adjustments', requireEmployeePermission('inventory', ['admin', 'inventory']), async (request, response) => {
     try {
         const dataAccess = getDataAccess();
         const payload = stockAdjustmentSchema.parse(request.body);
@@ -156,14 +189,9 @@ productsRouter.post('/adjustments', async (request, response) => {
     }
     catch (error) {
         if (error instanceof ZodError) {
-            response.status(400).json({
-                message: 'بيانات تعديل المخزون غير صالحة.',
-                issues: error.issues,
-            });
+            sendValidationError(response, 'بيانات تعديل المخزون غير صالحة.', error.issues);
             return;
         }
-        response.status(400).json({
-            message: error instanceof Error ? error.message : 'تعذر تنفيذ تعديل المخزون.',
-        });
+        sendOperationError(response, error, 'تعذر تنفيذ تعديل المخزون.');
     }
 });
