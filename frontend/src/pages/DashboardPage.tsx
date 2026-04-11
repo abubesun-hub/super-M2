@@ -7,6 +7,7 @@ import { buildDashboardSummaryRequest, createDefaultDashboardFilter, getDashboar
 import { buildExpiryAlertSummary, type ExpiryAlertSummary } from '../lib/expiry-alerts'
 import { exportRowsToCsv } from '../lib/export'
 import { fetchDashboardSummary, type DashboardSummary } from '../lib/dashboard-api'
+import { fetchSuppliersTotalDebt } from '../lib/suppliers-api'
 import { fetchInventoryBatches, fetchProducts } from '../lib/products-api'
 import { fetchPurchaseReceipts } from '../lib/purchases-api'
 import { getUserFacingErrorMessage } from '../lib/user-facing-errors'
@@ -120,6 +121,7 @@ function getExpiryLabel(daysUntilExpiry: number) {
 
 export function DashboardPage() {
   const [summary, setSummary] = useState<DashboardSummary | null>(null)
+  const [suppliersDebt, setSuppliersDebt] = useState<number | null>(null)
   const [filter, setFilter] = useState(createDefaultDashboardFilter)
   const [expirySummary, setExpirySummary] = useState<ExpiryAlertSummary>({
     alerts: [],
@@ -149,6 +151,14 @@ export function DashboardPage() {
     try {
       const data = await fetchDashboardSummary(buildDashboardSummaryRequest(nextFilter))
       setSummary(data)
+
+        // جلب ديون الموردين
+        try {
+          const debt = await fetchSuppliersTotalDebt()
+          setSuppliersDebt(debt)
+        } catch {
+          setSuppliersDebt(null)
+        }
 
       const [productsResult, receiptsResult, batchesResult] = await Promise.allSettled([
         fetchProducts(),
@@ -199,6 +209,7 @@ export function DashboardPage() {
       setMessage(null)
     } catch (error) {
       setMessage(getUserFacingErrorMessage(error, 'تعذر تحميل لوحة التشغيل.'))
+        setSuppliersDebt(null)
     } finally {
       setIsLoading(false)
     }
@@ -400,6 +411,13 @@ export function DashboardPage() {
             <p className="mt-3 font-display text-4xl font-black text-stone-950">{summary?.returnsCount ?? 0}</p>
             <p className="mt-2 text-sm text-stone-600">عدد المرتجعات خلال {salesPeriodLabel}</p>
           </article>
+
+            {/* بطاقة ديون الموردين */}
+            <article className="rounded-[28px] border border-amber-300 bg-amber-50/90 p-5 shadow-[0_24px_80px_rgba(180,83,9,0.10)] backdrop-blur-xl">
+              <p className="text-sm font-black tracking-[0.2em] text-amber-700">SUPPLIER DEBT</p>
+              <p className="mt-3 font-display text-4xl font-black text-amber-900">{suppliersDebt === null ? '...' : formatMoney(suppliersDebt, 'IQD')}</p>
+              <p className="mt-2 text-sm text-stone-600">إجمالي المبالغ المستحقة للموردين</p>
+            </article>
           <article className="rounded-[28px] border border-white/70 bg-[linear-gradient(180deg,#101826_0%,#172436_100%)] p-5 text-white shadow-[0_28px_90px_rgba(17,24,39,0.18)] md:col-span-2 xl:col-span-1">
             <p className="text-sm font-black tracking-[0.2em] text-amber-200/80">LOW STOCK</p>
             <p className="mt-3 font-display text-4xl font-black">{summary?.lowStockCount ?? 0}</p>

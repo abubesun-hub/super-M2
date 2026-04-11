@@ -339,6 +339,7 @@ export function PosPage() {
   const [differenceApprovalChecked, setDifferenceApprovalChecked] = useState(false)
   const [closingNote, setClosingNote] = useState('')
   const [isShiftExpanded, setIsShiftExpanded] = useState(false)
+  const [showCloseShiftAlert, setShowCloseShiftAlert] = useState(false)
   const [isQuickProductsOpen, setIsQuickProductsOpen] = useState(false)
 
   async function loadProducts() {
@@ -397,11 +398,25 @@ export function PosPage() {
       logout()
       return
     }
-
-    setIsShiftExpanded(true)
+    // إذا لم يتم إدخال مبلغ التسليم، أظهر رسالة تنبيه فقط
+    if (shiftInvoices.filter((inv) => inv.shiftId === currentShift.id).length > 0 && (!closingCashInput || Number(closingCashInput) <= 0)) {
+      setShowCloseShiftAlert(true)
+      return
+    }
+    // إذا كل شيء صحيح، أغلق الوردية وسجل الخروج
     const closed = await performCloseShift()
-
     if (closed) {
+      setClosingCashInput('')
+      logout()
+    }
+  }
+
+  async function handleForceCloseShiftAndLogout() {
+    // استخدم قيمة المودال فقط
+    const closed = await performCloseShift(modalClosingCashInput)
+    if (closed) {
+      setForceCloseShiftModal(false)
+      setClosingCashInput('') // إعادة تعيين القيمة الأصلية بعد الإغلاق
       logout()
     }
   }
@@ -594,18 +609,27 @@ export function PosPage() {
     }
   }
 
-  async function performCloseShift(): Promise<boolean> {
+  // تعديل: السماح بتمرير قيمة مخصصة لمبلغ التسليم (للمودال)
+  async function performCloseShift(overrideClosingCashInput?: string): Promise<boolean> {
     if (!currentShift) {
       setMessage('لا توجد وردية مفتوحة لإغلاقها.')
       return false
     }
 
-    const closingCashIqd = Number(closingCashInput)
+    // تحقق من وجود فواتير بيع مرتبطة بالوردية
+    const shiftSaleInvoices = shiftInvoices.filter((inv) => inv.shiftId === currentShift.id)
+    const hasSaleInvoices = shiftSaleInvoices.length > 0
 
-    if (!Number.isFinite(closingCashIqd) || closingCashIqd < 0) {
-      setMessage('أدخل مبلغ التسليم الفعلي بالدينار قبل إغلاق الوردية.')
-      return false
+    // استخدم قيمة المودال إذا وجدت، وإلا استخدم قيمة الصفحة الأصلية
+    const closingCashIqd = Number(overrideClosingCashInput ?? closingCashInput)
+
+    if (hasSaleInvoices) {
+      if (!Number.isFinite(closingCashIqd) || closingCashIqd < 0) {
+        setMessage('❌ لا يمكن إغلاق الوردية: يجب إدخال مبلغ التسليم الفعلي بالدينار لأن هناك فواتير بيع مرتبطة بهذه الوردية. أدخل المبلغ أولاً.')
+        return false
+      }
     }
+    // إذا لم توجد فواتير، يمكن الإغلاق بدون إدخال مبلغ
 
     if (requiresDifferenceApproval) {
       if (closingNote.trim().length < 8) {
@@ -636,7 +660,6 @@ export function PosPage() {
           })
         : false
       setShifts((current) => current.map((entry) => (entry.id === shift.id ? shift : entry)))
-      setClosingCashInput('')
       setClosingDenominations({})
       setDifferenceApprovalChecked(false)
       setClosingNote('')
@@ -651,6 +674,11 @@ export function PosPage() {
   }
 
   async function handleCloseShift() {
+    if (!currentShift) return;
+    if (shiftInvoices.filter((inv) => inv.shiftId === currentShift.id).length > 0 && (!closingCashInput || Number(closingCashInput) <= 0)) {
+      setShowCloseShiftAlert(true)
+      return
+    }
     await performCloseShift()
   }
 
@@ -1008,7 +1036,24 @@ export function PosPage() {
   }
 
   return (
-    <main className="min-h-screen bg-[linear-gradient(180deg,#f4efe3_0%,#efe7d8_45%,#f8f5ef_100%)] px-4 py-5 text-stone-900 sm:px-6 lg:px-8">
+    <>
+      {/* رسالة تنبيه عند محاولة الإغلاق بدون مبلغ تسليم */}
+      {showCloseShiftAlert && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60">
+          <div className="w-full max-w-sm rounded-2xl bg-white p-8 shadow-2xl flex flex-col items-center">
+            <h2 className="mb-4 text-xl font-black text-rose-700 text-center">يجب عليك إدخال مبلغ غلق الوردية في مبلغ التسليم أولاً لإغلاق الوردية.</h2>
+            <button
+              className="mt-4 rounded-2xl bg-rose-700 px-8 py-3 text-base font-black text-white transition hover:bg-rose-600"
+              onClick={() => setShowCloseShiftAlert(false)}
+              type="button"
+            >
+              موافق
+            </button>
+          </div>
+        </div>
+      )}
+      {/* باقي التطبيق */}
+      <main className="min-h-screen bg-[linear-gradient(180deg,#f4efe3_0%,#efe7d8_45%,#f8f5ef_100%)] px-4 py-5 text-stone-900 sm:px-6 lg:px-8">
       <div className="mx-auto max-w-7xl">
         <header className="rounded-[30px] border border-white/75 bg-white/80 px-5 py-4 shadow-[0_24px_80px_rgba(77,60,27,0.10)] backdrop-blur-xl sm:px-6">
           <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
@@ -1285,12 +1330,13 @@ export function PosPage() {
                       </label>
                       <button
                         className="rounded-2xl bg-rose-700 px-5 py-3 text-base font-black text-white transition hover:bg-rose-600 disabled:cursor-not-allowed disabled:bg-stone-400"
-                        disabled={isShiftSubmitting || !closingCashInput.trim()}
+                        disabled={isShiftSubmitting}
                         onClick={() => void handleCloseShift()}
                         type="button"
                       >
                         {isShiftSubmitting ? 'جارٍ الإغلاق...' : 'إغلاق الوردية'}
                       </button>
+                      <FeedbackMessage message={message} onClear={() => setMessage(null)} />
                     </>
                   )}
                 </div>
@@ -1755,5 +1801,6 @@ export function PosPage() {
         </section>
       </div>
     </main>
+    </>
   )
 }

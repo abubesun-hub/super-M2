@@ -58,6 +58,7 @@ export interface SuppliersRepository {
   listPayments(supplierId: string): Promise<SupplierPayment[]>
   createSupplier(input: SupplierUpsertInput): Promise<Supplier>
   updateSupplier(supplierId: string, input: SupplierUpsertInput): Promise<Supplier>
+  getSuppliersTotalDebt(): Promise<number>
   createPayment(supplierId: string, input: SupplierPaymentInput & { createdByEmployeeId: string; createdByEmployeeName: string }): Promise<SupplierPayment>
   deleteSupplier(supplierId: string): Promise<Supplier>
 }

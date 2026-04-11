@@ -17,6 +17,13 @@ suppliersRouter.get('/', async (_request, response) => {
   })
 })
 
+// مجموع ديون الموردين
+suppliersRouter.get('/total-debt', async (_request, response) => {
+  const dataAccess = getDataAccess()
+  const totalDebt = await dataAccess.suppliers.getSuppliersTotalDebt()
+  response.json({ data: { totalDebt } })
+})
+
 suppliersRouter.post('/', async (request, response) => {
   try {
     const dataAccess = getDataAccess()

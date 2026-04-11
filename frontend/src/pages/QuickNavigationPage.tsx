@@ -6,6 +6,7 @@ import { useEmployeeSession } from '../lib/auth'
 import { formatMoney } from '../lib/currency'
 import { buildDashboardSummaryRequest, createDefaultDashboardFilter, getDashboardFilterLabel } from '../lib/dashboard-periods'
 import { fetchDashboardSummary, type DashboardSummary } from '../lib/dashboard-api'
+import { fetchSuppliersTotalDebt } from '../lib/suppliers-api'
 import { buildExpiryAlertSummary, type ExpiryAlertSummary } from '../lib/expiry-alerts'
 import { hasPermission } from '../lib/permissions'
 import { fetchProducts } from '../lib/products-api'
@@ -150,6 +151,7 @@ export function QuickNavigationPage() {
     affectedProductsCount: 0,
   })
   const [isLoading, setIsLoading] = useState(true)
+    const [suppliersDebt, setSuppliersDebt] = useState<number | null>(null)
   const [isLoggingOut, setIsLoggingOut] = useState(false)
   const [message, setMessage] = useState<string | null>(null)
   const storeName = viewerSettings?.storeName || 'Super M2'
@@ -181,6 +183,14 @@ export function QuickNavigationPage() {
       const dashboardData = await fetchDashboardSummary(buildDashboardSummaryRequest(nextFilter))
       setSummary(dashboardData)
 
+        // جلب ديون الموردين
+        try {
+          const debt = await fetchSuppliersTotalDebt()
+          setSuppliersDebt(debt)
+        } catch {
+          setSuppliersDebt(null)
+        }
+
       const [productsResult, receiptsResult] = await Promise.allSettled([
         fetchProducts(),
         fetchPurchaseReceipts(),
@@ -201,6 +211,7 @@ export function QuickNavigationPage() {
       setMessage(null)
     } catch (error) {
       setMessage(getUserFacingErrorMessage(error, 'تعذر تحميل بيانات صفحة التنقل السريع.'))
+        setSuppliersDebt(null)
     } finally {
       setIsLoading(false)
     }
@@ -329,6 +340,17 @@ export function QuickNavigationPage() {
       labelClassName: 'text-stone-300',
       icon: 'stock' as IconName,
     },
+      {
+        key: 'suppliers-debt',
+        eyebrow: 'SUPPLIER DEBT',
+        value: isLoading ? '...' : suppliersDebt === null ? '...' : formatMoney(suppliersDebt, 'IQD'),
+        label: 'إجمالي المبالغ المستحقة للموردين',
+        className: 'min-h-[190px] rounded-[28px] border border-amber-300 bg-amber-50/90 p-5 shadow-[0_24px_80px_rgba(180,83,9,0.10)] backdrop-blur-xl',
+        eyebrowClassName: 'text-amber-700',
+        valueClassName: 'text-amber-900',
+        labelClassName: 'text-stone-600',
+        icon: 'cash' as IconName,
+      },
   ] as const
 
   return (

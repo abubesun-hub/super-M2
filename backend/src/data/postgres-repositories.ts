@@ -2459,16 +2459,15 @@ export function createPostgresDataAccess(pool: Pool): DataAccess {
         return result.rows.map(mapProductRow)
       },
       async listMovements() {
-        const result = await pool.query<MovementRow>(
+        const result = await pool.query(
           `
-            select id, product_id, product_name, movement_type, quantity_delta, balance_after, note, created_at
-            from app_stock_movements
+            select id, movement_no, movement_date, direction, amount_iqd, source_fund_account_id, source_fund_account_name, destination_fund_account_id, destination_fund_account_name, reason, reference_type, reference_id, counterparty_name, notes, created_by_employee_id, created_by_employee_name, created_at
+            from app_fund_movements
             order by created_at desc
             limit 500
-          `,
-        )
-
-        return result.rows.map(mapMovementRow)
+          `
+        );
+        return result.rows;
       },
       async listBatches(productId?: string) {
         return loadInventoryBatches(pool, productId ? [productId] : undefined)
@@ -4120,6 +4119,19 @@ export function createPostgresDataAccess(pool: Pool): DataAccess {
               })
             : null
 
+          // تحديث رصيد صندوق الإيرادات ليكون مجموع كل الحركات shift-remittance
+          if (revenueFund) {
+            const { rows } = await client.query(
+              `select coalesce(sum(amount_iqd),0) as total from app_fund_movements where reason = 'shift-remittance' and direction = 'inflow' and destination_fund_account_id = $1`,
+              [revenueFund.id]
+            );
+            const totalRemittance = Number(rows[0]?.total ?? 0);
+            await client.query(
+              'update app_fund_accounts set current_balance_iqd = $1 where id = $2',
+              [totalRemittance, revenueFund.id]
+            );
+          }
+
           const result = await client.query<ShiftRow>(
             `
               update app_cashier_shifts
@@ -4349,6 +4361,13 @@ export function createPostgresDataAccess(pool: Pool): DataAccess {
 
         return result.rows.map(mapSupplierRow)
       },
+
+       async getSuppliersTotalDebt() {
+         const result = await pool.query<{ total_debt: number }>(
+           `select coalesce(sum(current_balance), 0) as total_debt from app_suppliers where current_balance > 0`
+         )
+         return Number(result.rows[0]?.total_debt ?? 0)
+       },
       async listPayments(supplierId) {
         const supplier = await pool.query<{ id: string }>('select id from app_suppliers where id = $1', [supplierId])
 
@@ -4669,24 +4688,8 @@ export function createPostgresDataAccess(pool: Pool): DataAccess {
               throw new Error(`الصنف ${item.name} غير موجود في كتالوج المخزون.`)
             }
 
-            await consumeInventoryBatchesForSale(client, {
-              saleItemId,
-              productId: item.productId,
-              quantity: item.baseQuantity,
-            })
-
-            const nextStock = roundQuantity(asNumber(product.stock_qty) - item.baseQuantity)
-
-            await client.query('update app_products set stock_qty = $1, updated_at = now() where id = $2', [nextStock, item.productId])
-            await insertStockMovement(client, {
-              id: createId('movement'),
-              productId: item.productId,
-              productName: item.name,
-              movementType: 'sale',
-              quantityDelta: roundQuantity(-item.baseQuantity),
-              balanceAfter: nextStock,
-              note: `خصم بيع عبر POS للصنف ${item.name}`,
-            })
+            // Insert the sale invoice item first so any foreign keys referencing it (allocations)
+            // can be created safely afterwards.
             await client.query(
               `
                 insert into app_sale_invoice_items (
@@ -4712,6 +4715,26 @@ export function createPostgresDataAccess(pool: Pool): DataAccess {
                 item.source,
               ],
             )
+
+            // Now consume batches and create allocations that reference the saved sale item
+            await consumeInventoryBatchesForSale(client, {
+              saleItemId,
+              productId: item.productId,
+              quantity: item.baseQuantity,
+            })
+
+            const nextStock = roundQuantity(asNumber(product.stock_qty) - item.baseQuantity)
+
+            await client.query('update app_products set stock_qty = $1, updated_at = now() where id = $2', [nextStock, item.productId])
+            await insertStockMovement(client, {
+              id: createId('movement'),
+              productId: item.productId,
+              productName: item.name,
+              movementType: 'sale',
+              quantityDelta: roundQuantity(-item.baseQuantity),
+              balanceAfter: nextStock,
+              note: `خصم بيع عبر POS للصنف ${item.name}`,
+            })
           }
 
           for (const payment of input.payments) {
