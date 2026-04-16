@@ -32,7 +32,7 @@ export interface ProductRepository {
 }
 
 export interface SalesRepository {
-  listInvoices(): Promise<StoredSaleInvoice[]>
+  listInvoices(employeeId?: string): Promise<StoredSaleInvoice[]>
   createInvoice(input: CreateSaleInvoiceInput): Promise<StoredSaleInvoice>
   createReturn(invoiceId: string, input: CreateSaleReturnInput): Promise<StoredSaleInvoice>
 }

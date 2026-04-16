@@ -1,3 +1,90 @@
+// نموذج العرض المؤقت
+export type Offer = {
+  id: string;
+  productId: string;
+  type: 'discount' | 'new-price' | 'bundle';
+  value: number; // نسبة الخصم أو السعر الجديد
+  originalRetailPrice: number;
+  originalWholesalePrice?: number;
+  startDate: string;
+  endDate?: string;
+  endOnDepletion?: boolean;
+  active: boolean;
+};
+
+// قائمة العروض المؤقتة في الذاكرة
+export const offers: Offer[] = [];
+
+// تفعيل عرض مؤقت على منتج
+export function activateOffer(params: {
+  productId: string;
+  type: 'discount' | 'new-price' | 'bundle';
+  value: number;
+  durationDays?: number;
+  endOnDepletion?: boolean;
+}) {
+  const products = listCatalogProducts();
+  const product = products.find(p => p.id === params.productId);
+  if (!product) throw new Error('المنتج غير موجود');
+  // حفظ السعر الأصلي
+  const originalRetailPrice = product.retailSalePrice;
+  const originalWholesalePrice = product.wholesaleSalePrice;
+  // حساب السعر الجديد
+  let newRetailPrice = originalRetailPrice;
+  let newWholesalePrice = originalWholesalePrice;
+  if (params.type === 'discount') {
+    newRetailPrice = Math.round(originalRetailPrice * (1 - params.value));
+    if (originalWholesalePrice)
+      newWholesalePrice = Math.round(originalWholesalePrice * (1 - params.value));
+  } else if (params.type === 'new-price') {
+    newRetailPrice = params.value;
+  }
+  // تحديث سعر المنتج مؤقتاً
+  updateCatalogProduct(product.id, {
+    ...product,
+    retailSalePrice: newRetailPrice,
+    wholesaleSalePrice: newWholesalePrice,
+  });
+  // إضافة العرض لقائمة العروض
+  const offer: Offer = {
+    id: createId('offer'),
+    productId: product.id,
+    type: params.type,
+    value: params.value,
+    originalRetailPrice,
+    originalWholesalePrice,
+    startDate: new Date().toISOString(),
+    endDate: params.durationDays ? new Date(Date.now() + params.durationDays * 86400000).toISOString() : undefined,
+    endOnDepletion: params.endOnDepletion,
+    active: true,
+  };
+  offers.push(offer);
+  return offer;
+}
+
+// دالة تحقق دورية لإلغاء العروض المنتهية أو عند نفاد الكمية
+export function checkAndDeactivateOffers() {
+  const products = listCatalogProducts();
+  for (const offer of offers) {
+    if (!offer.active) continue;
+    const product = products.find(p => p.id === offer.productId);
+    if (!product) continue;
+    const now = new Date();
+    const isExpired = offer.endDate && new Date(offer.endDate) <= now;
+    const isDepleted = offer.endOnDepletion && product.stockQty <= 0;
+    if (isExpired || isDepleted) {
+      // إعادة السعر الأصلي
+      updateCatalogProduct(product.id, {
+        ...product,
+        retailSalePrice: offer.originalRetailPrice,
+        wholesaleSalePrice: offer.originalWholesalePrice,
+      });
+      offer.active = false;
+    }
+  }
+}
+
+// يمكن استدعاء checkAndDeactivateOffers دورياً (مثلاً عند كل عملية بيع أو كل ساعة)
 import {
   adjustCustomerBalance,
   createCustomer,
@@ -270,8 +357,9 @@ export function createMemoryDataAccess(): DataAccess {
       },
     },
     sales: {
-      async listInvoices() {
-        return listSaleInvoices()
+      async listInvoices(employeeId?: string) {
+        const all = listSaleInvoices()
+        return employeeId ? all.filter(inv => inv.employeeId === employeeId) : all
       },
       async createInvoice(input: CreateSaleInvoiceInput) {
         const currentProducts = listCatalogProducts()

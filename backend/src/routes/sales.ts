@@ -13,11 +13,12 @@ function roundMoney(value: number) {
   return Number(value.toFixed(2))
 }
 
-salesRouter.get('/invoices', async (_request, response) => {
+salesRouter.get('/invoices', async (request, response) => {
   const dataAccess = getDataAccess()
-
+  // إذا كان المستخدم كاشير، أعد فقط فواتيره
+  const employeeId = request.authEmployee?.role === 'cashier' ? request.authEmployee.id : undefined
   response.json({
-    data: await dataAccess.sales.listInvoices(),
+    data: await dataAccess.sales.listInvoices(employeeId),
   })
 })
 

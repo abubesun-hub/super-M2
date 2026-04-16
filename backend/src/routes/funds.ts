@@ -26,6 +26,11 @@ fundsRouter.get('/capital-transactions', requireEmployeePermission('expenses', [
   response.json({ data: await dataAccess.funds.listCapitalTransactions() })
 })
 
+fundsRouter.get('/contributors', requireEmployeePermission('expenses', ['admin', 'accountant']), async (_request, response) => {
+  const dataAccess = getDataAccess()
+  response.json({ data: await dataAccess.funds.listContributors() })
+})
+
 fundsRouter.post('/capital-transactions', requireEmployeePermission('expenses', ['admin', 'accountant']), async (request, response) => {
   try {
     const dataAccess = getDataAccess()
@@ -46,6 +51,19 @@ fundsRouter.post('/capital-transactions', requireEmployeePermission('expenses', 
 
     response.status(201).json({ data: movement })
   } catch (error) {
+    try {
+      // log request and error details to help diagnose intermittent duplicate errors
+      // eslint-disable-next-line no-console
+      console.error('[route] POST /funds/capital-transactions error', {
+        body: request.body,
+        message: error instanceof Error ? error.message : String(error),
+        stack: error instanceof Error ? error.stack : undefined,
+        code: (error as any)?.code,
+        constraint: (error as any)?.constraint,
+      })
+    } catch (logErr) {
+      // ignore logging failures
+    }
     if (error instanceof ZodError) {
       sendValidationError(response, 'بيانات حركة رأس المال غير صالحة.', error.issues)
       return

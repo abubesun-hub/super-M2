@@ -10,6 +10,7 @@ import {
   deleteCapitalTransaction,
   fetchCapitalTransactions,
   fetchFundAccounts,
+  fetchCapitalContributors,
   updateCapitalTransaction,
   type CapitalTransaction,
   type CapitalTransactionPayload,
@@ -171,6 +172,8 @@ export function CashRevenuesPage() {
   const [invoices, setInvoices] = useState<StoredSaleInvoice[]>([])
   const [contributionForm, setContributionForm] = useState<SimpleCapitalForm>(emptyForm)
   const [repaymentForm, setRepaymentForm] = useState<SimpleCapitalForm>(emptyForm)
+  const [contributors, setContributors] = useState<import('../lib/funds-api').CapitalContributor[]>([])
+  const [isAddingContributor, setIsAddingContributor] = useState(false)
   const [editingTransactionId, setEditingTransactionId] = useState<string | null>(null)
   const [editForm, setEditForm] = useState<EditCapitalForm>(emptyEditForm)
   const [message, setMessage] = useState<string | null>(null)
@@ -189,17 +192,19 @@ export function CashRevenuesPage() {
     setIsLoading(true)
 
     try {
-      const [nextAccounts, nextTransactions, nextShifts, nextInvoices] = await Promise.all([
+      const [nextAccounts, nextTransactions, nextShifts, nextInvoices, nextContributors] = await Promise.all([
         fetchFundAccounts(),
         fetchCapitalTransactions(),
         fetchShifts(),
         fetchSaleInvoices(),
+        fetchCapitalContributors(),
       ])
 
       setFundAccounts(nextAccounts)
       setTransactions([...nextTransactions].sort(sortByNewest))
       setShifts(nextShifts)
       setInvoices(nextInvoices)
+      setContributors(nextContributors)
       setMessage(null)
     } catch (error) {
       setMessage(getUserFacingErrorMessage(error, 'تعذر تحميل بيانات الإيرادات النقدية.'))
@@ -817,11 +822,39 @@ export function CashRevenuesPage() {
 
                 <label className="block text-sm font-black text-stone-800">
                   اسم المساهم
-                  <input
+                  <select
                     className="mt-2 h-12 w-full rounded-2xl border border-stone-300 bg-white px-4 text-right text-stone-900 outline-none focus:border-emerald-500"
-                    value={contributionForm.contributorName}
-                    onChange={(event) => setContributionForm((current) => ({ ...current, contributorName: event.target.value }))}
-                  />
+                    value={isAddingContributor ? '__new__' : contributionForm.contributorName}
+                    onChange={(event) => {
+                      const val = event.target.value
+                      if (val === '__new__') {
+                        setIsAddingContributor(true)
+                        setContributionForm((current) => ({ ...current, contributorName: '' }))
+                      } else {
+                        setIsAddingContributor(false)
+                        setContributionForm((current) => ({ ...current, contributorName: val }))
+                      }
+                    }}
+                  >
+                    <option value="">اختر اسم المساهم أو أضف جديد</option>
+                    {contributors.map((c) => (
+                      <option key={c.contributorName} value={c.contributorName}>
+                        {c.contributorName} - {formatMoney(c.balanceIqd, 'IQD')}
+                      </option>
+                    ))}
+                    <option value="__new__">أضف مساهم جديد...</option>
+                  </select>
+
+                  {isAddingContributor ? (
+                    <input
+                      className="mt-2 h-12 w-full rounded-2xl border border-stone-300 bg-white px-4 text-right text-stone-900 outline-none focus:border-emerald-500"
+                      placeholder="اكتب اسم المساهم الجديد"
+                      value={contributionForm.contributorName}
+                      onChange={(event) => setContributionForm((current) => ({ ...current, contributorName: event.target.value }))}
+                    />
+                  ) : null}
+
+                  <p className="mt-2 text-xs font-bold text-stone-500">اختر مساهمًا محفوظًا أو أضف مساهمًا جديدًا.</p>
                 </label>
               </div>
 

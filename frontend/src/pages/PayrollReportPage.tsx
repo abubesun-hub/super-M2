@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import * as XLSX from 'xlsx'
 import { FeedbackMessage } from '../components/FeedbackMessage'
@@ -188,8 +188,137 @@ export function PayrollReportPage() {
     }
   }
 
+  function buildPrintableHtml() {
+    const title = `تقرير الرواتب الشهرية - ${selectedMonth}`
+    const printedDate = formatDate(new Date().toISOString().slice(0, 10))
+
+    const summaryCards = `
+      <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px;">
+        <div style="flex:1;min-width:160px;border:1px solid #e5e7eb;border-radius:8px;padding:12px;text-align:center;">
+          <div style="font-weight:700;color:#374151">إجمالي الاستحقاقات التراكمية</div>
+          <div style="margin-top:8px;font-size:20px;font-weight:800">${formatMoney(cumulativeExpected, 'IQD')}</div>
+        </div>
+        <div style="flex:1;min-width:160px;border:1px solid #e5e7eb;border-radius:8px;padding:12px;text-align:center;">
+          <div style="font-weight:700;color:#374151">المسدد والسلف</div>
+          <div style="margin-top:8px;font-size:20px;font-weight:800">${formatMoney(cumulativePaid, 'IQD')}</div>
+        </div>
+        <div style="flex:1;min-width:160px;border:1px solid #e5e7eb;border-radius:8px;padding:12px;text-align:center;">
+          <div style="font-weight:700;color:#374151">المتبقي على ذمة السوبر ماركت</div>
+          <div style="margin-top:8px;font-size:20px;font-weight:800">${formatMoney(cumulativeRemaining, 'IQD')}</div>
+        </div>
+        <div style="flex:1;min-width:120px;border:1px solid #e5e7eb;border-radius:8px;padding:12px;text-align:center;">
+          <div style="font-weight:700;color:#374151">الموظفون في الملخص</div>
+          <div style="margin-top:8px;font-size:20px;font-weight:800">${filteredCumulative.length}</div>
+        </div>
+      </div>
+    `
+
+    const rows = filteredCumulative.map((entry) => `
+      <tr>
+        <td style="padding:8px;border:1px solid #e5e7eb;text-align:right">${entry.employeeNo}</td>
+        <td style="padding:8px;border:1px solid #e5e7eb;text-align:right;font-weight:700">${entry.employeeName}</td>
+        <td style="padding:8px;border:1px solid #e5e7eb;text-align:right">${getRoleLabel(entry.role)}</td>
+        <td style="padding:8px;border:1px solid #e5e7eb;text-align:right">${formatMoney(entry.totalExpectedNetSalaryIqd, 'IQD')}</td>
+        <td style="padding:8px;border:1px solid #e5e7eb;text-align:right">${formatMoney(entry.totalPaidOutIqd, 'IQD')}</td>
+        <td style="padding:8px;border:1px solid #e5e7eb;text-align:right;font-weight:800">${formatMoney(entry.totalOutstandingIqd, 'IQD')}</td>
+      </tr>
+    `).join('\n')
+
+    return `
+      <!doctype html>
+      <html lang="ar" dir="rtl">
+      <head>
+        <meta charset="utf-8">
+        <title>${title}</title>
+        <meta name="viewport" content="width=device-width,initial-scale=1">
+        <style>
+          body { font-family: Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Noto Sans', Arial; color:#111827; direction: rtl; margin:24px }
+          h1 { text-align:center; font-size:28px; margin:0 0 8px }
+          .meta { display:flex; justify-content:space-between; gap:12px; font-size:14px; margin-bottom:12px }
+          table { width:100%; border-collapse:collapse; margin-top:12px }
+          th { background:#f3f4f6; padding:10px; border:1px solid #e5e7eb; text-align:right }
+        </style>
+      </head>
+      <body>
+        <div style="max-width:960px;margin:0 auto">
+          <h1>تقرير الرواتب الشهرية</h1>
+          <div style="text-align:center;color:#6b7280;margin-bottom:8px">نسخة طباعة مختصرة تركز على المعلومات المالية الأساسية فقط.</div>
+          <div class="meta">
+            <div><strong>الشهر:</strong> ${selectedMonth}</div>
+            <div><strong>الموظف:</strong> ${selectedEmployeeLabel}</div>
+            <div><strong>تاريخ الطباعة:</strong> ${printedDate}</div>
+          </div>
+          ${summaryCards}
+          <table>
+            <thead>
+              <tr>
+                <th>رقم الموظف</th>
+                <th>الموظف</th>
+                <th>الدور</th>
+                <th>إجمالي الاستحقاق</th>
+                <th>المسدد والسلف</th>
+                <th>المتبقي</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows}
+            </tbody>
+          </table>
+        </div>
+      </body>
+      </html>
+    `
+  }
+
   function handlePrint() {
-    window.print()
+    const html = buildPrintableHtml()
+    try {
+      // create a hidden iframe to avoid popup blockers
+      const iframe = document.createElement('iframe')
+      iframe.style.position = 'fixed'
+      iframe.style.right = '0'
+      iframe.style.bottom = '0'
+      iframe.style.width = '0'
+      iframe.style.height = '0'
+      iframe.style.border = '0'
+      iframe.style.overflow = 'hidden'
+      iframe.setAttribute('aria-hidden', 'true')
+      document.body.appendChild(iframe)
+
+      const idoc = iframe.contentWindow?.document
+      if (!idoc) {
+        document.body.removeChild(iframe)
+        window.print()
+        return
+      }
+
+      idoc.open()
+      idoc.write(html)
+      idoc.close()
+
+      // Wait for content to render, then print
+      const doPrint = () => {
+        try {
+          iframe.contentWindow?.focus()
+          iframe.contentWindow?.print()
+        } finally {
+          setTimeout(() => {
+            try { document.body.removeChild(iframe) } catch (e) { /* noop */ }
+          }, 500)
+        }
+      }
+
+      // If iframe has loaded, print; otherwise fallback after short delay
+      if (iframe.contentWindow?.document.readyState === 'complete') {
+        doPrint()
+      } else {
+        // give time for fonts/images
+        setTimeout(doPrint, 500)
+      }
+    } catch (err) {
+      // fallback to normal print of the current page
+      window.print()
+    }
   }
 
   function handleExport() {
@@ -253,7 +382,7 @@ export function PayrollReportPage() {
 
         <FeedbackMessage message={message} onClear={() => setMessage(null)} successClassName="mt-6 rounded-[24px] border border-amber-300/50 bg-amber-50 px-5 py-4 text-sm font-bold text-amber-900" />
 
-        <section className="hidden print:block">
+        <section className="print hidden print:block">
           <div className="rounded-[20px] border border-stone-300 bg-white p-6 text-stone-900">
             <div className="flex items-start justify-between gap-6 border-b border-stone-200 pb-4">
               <div>

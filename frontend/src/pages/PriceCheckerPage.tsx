@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { FeedbackMessage } from '../components/FeedbackMessage'
 import { formatMoney } from '../lib/currency'
@@ -32,6 +32,7 @@ export function PriceCheckerPage() {
   const [message, setMessage] = useState<string | null>(null)
   const [lastLookupAt, setLastLookupAt] = useState<string | null>(null)
   const [isLoading, setIsLoading] = useState(true)
+  const clearTimerRef = useRef<number | null>(null)
 
   async function loadProducts() {
     setIsLoading(true)
@@ -49,6 +50,16 @@ export function PriceCheckerPage() {
 
   useEffect(() => {
     void loadProducts()
+  }, [])
+
+  // cleanup any pending timer on unmount
+  useEffect(() => {
+    return () => {
+      if (clearTimerRef.current) {
+        window.clearTimeout(clearTimerRef.current)
+        clearTimerRef.current = null
+      }
+    }
   }, [])
 
   const suggestions = useMemo(() => {
@@ -79,9 +90,24 @@ export function PriceCheckerPage() {
     const scannedMatch = findPriceCheckerProductByScan(products, normalized)
 
     if (scannedMatch) {
+      // clear any previous auto-clear timer
+      if (clearTimerRef.current) {
+        window.clearTimeout(clearTimerRef.current)
+        clearTimerRef.current = null
+      }
+
       setSelectedProduct(scannedMatch)
       setLastLookupAt(new Date().toISOString())
       setMessage(null)
+
+      // Automatically clear the displayed barcode and selected product after 5 seconds
+      clearTimerRef.current = window.setTimeout(() => {
+        setSelectedProduct(null)
+        setQuery('')
+        setLastLookupAt(null)
+        clearTimerRef.current = null
+      }, 5000)
+
       return
     }
 

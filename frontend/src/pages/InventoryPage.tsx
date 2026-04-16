@@ -71,15 +71,19 @@ const emptyProductForm: ProductFormState = {
   minStock: '0',
 }
 
-function formatQuantity(value: number) {
-  return Number.isInteger(value) ? String(value) : value.toFixed(3)
+function formatQuantity(value: number | undefined | null) {
+  if (typeof value !== 'number' || isNaN(value)) return 'غير محدد';
+  return Number.isInteger(value) ? String(value) : value.toFixed(3);
 }
 
-function formatDate(value: string) {
+function formatDate(value: string | undefined | null) {
+  if (!value) return 'غير محدد';
+  const date = new Date(value);
+  if (isNaN(date.getTime())) return 'غير محدد';
   return new Intl.DateTimeFormat('ar-IQ', {
     dateStyle: 'medium',
     timeStyle: 'short',
-  }).format(new Date(value))
+  }).format(date);
 }
 
 function getRetailUnitOptions(measurementType: ProductFormState['measurementType']) {

@@ -331,6 +331,8 @@ export function PosPage() {
   const [shiftInvoices, setShiftInvoices] = useState<StoredSaleInvoice[]>([])
   const [isShiftsLoading, setIsShiftsLoading] = useState(true)
   const [isShiftSubmitting, setIsShiftSubmitting] = useState(false)
+  // قائمة الأجهزة الممكنة (يمكنك تعديلها حسب الواقع)
+  const allTerminals = ['POS-1', 'POS-2', 'POS-3', 'POS-4']
   const [terminalName, setTerminalName] = useState(() => readStoredTerminalName())
   const [openingFloatInput, setOpeningFloatInput] = useState('0')
   const [openingNote, setOpeningNote] = useState('')
@@ -370,6 +372,10 @@ export function PosPage() {
     }
   }
 
+  // احسب الأجهزة المشغولة حالياً
+  const busyTerminals = useMemo(() => shifts.filter(s => s.status === 'open').map(s => s.terminalName), [shifts])
+  const availableTerminals = useMemo(() => allTerminals.filter(t => !busyTerminals.includes(t)), [allTerminals, busyTerminals])
+
   async function loadShifts() {
     if (!session) {
       setShifts([])
@@ -398,17 +404,14 @@ export function PosPage() {
       logout()
       return
     }
-    // إذا لم يتم إدخال مبلغ التسليم، أظهر رسالة تنبيه فقط
+    // إذا كانت هناك فواتير بيع ولم يتم إدخال مبلغ التسليم، أظهر رسالة تنبيه فقط ولا تغلق الوردية ولا تخرج
     if (shiftInvoices.filter((inv) => inv.shiftId === currentShift.id).length > 0 && (!closingCashInput || Number(closingCashInput) <= 0)) {
       setShowCloseShiftAlert(true)
       return
     }
-    // إذا كل شيء صحيح، أغلق الوردية وسجل الخروج
-    const closed = await performCloseShift()
-    if (closed) {
-      setClosingCashInput('')
-      logout()
-    }
+    // إذا تم إدخال مبلغ التسليم، يجب على المستخدم إغلاق الوردية يدويًا أولاً من واجهة إغلاق الوردية، ثم يمكنه تسجيل الخروج
+    setMessage('يرجى إغلاق الوردية أولاً من واجهة إغلاق الوردية، ثم يمكنك تسجيل الخروج.');
+    return;
   }
 
   async function handleForceCloseShiftAndLogout() {
@@ -584,6 +587,19 @@ export function PosPage() {
     setDifferenceApprovalChecked(false)
   }, [closingCashInput, closingNote, currentShift?.id])
 
+  // تحديث الورديات تلقائياً عند فتح الصفحة أو عند التركيز على النافذة
+  useEffect(() => {
+    function handleFocus() {
+      loadShifts()
+    }
+    window.addEventListener('focus', handleFocus)
+    // تحميل أولي عند فتح الصفحة
+    loadShifts()
+    return () => {
+      window.removeEventListener('focus', handleFocus)
+    }
+  }, [])
+
   async function handleOpenShift() {
     if (!session) {
       setMessage('انتهت جلسة الموظف. أعد تسجيل الدخول.')
@@ -675,7 +691,10 @@ export function PosPage() {
 
   async function handleCloseShift() {
     if (!currentShift) return;
-    if (shiftInvoices.filter((inv) => inv.shiftId === currentShift.id).length > 0 && (!closingCashInput || Number(closingCashInput) <= 0)) {
+    // Allow closing without entering a cash remittance when the shift has
+    // invoices but the expected cash is zero (e.g., all sales on credit).
+    const expectedCash = currentShift.closingSummary?.expectedCashIqd ?? 0
+    if (expectedCash > 0 && (!closingCashInput || Number(closingCashInput) <= 0)) {
       setShowCloseShiftAlert(true)
       return
     }
@@ -1177,11 +1196,20 @@ export function PosPage() {
                 <div className="space-y-4 rounded-[24px] border border-stone-200 bg-white p-4">
                   <label className="block text-sm font-bold text-stone-800">
                     اسم الجهاز
-                    <input
+                    <select
                       className="mt-2 h-12 w-full rounded-2xl border border-stone-300 bg-white px-4 text-right text-stone-900 outline-none focus:border-teal-500"
                       value={terminalName}
                       onChange={(event) => setTerminalName(event.target.value)}
-                    />
+                      disabled={isShiftSubmitting || availableTerminals.length === 0}
+                    >
+                      <option value="" disabled>اختر جهازاً متاحاً</option>
+                      {availableTerminals.map((t) => (
+                        <option key={t} value={t}>{t}</option>
+                      ))}
+                    </select>
+                    {availableTerminals.length === 0 && (
+                      <div className="mt-2 text-xs text-rose-700">لا يوجد أي جهاز متاح حالياً. جميع الأجهزة عليها ورديات مفتوحة.</div>
+                    )}
                   </label>
 
                   {!currentShift ? (

@@ -550,25 +550,38 @@ function mapInventoryBatchRow(row: InventoryBatchRow): InventoryBatch {
   }
 }
 
-async function loadInvoices(database: Queryable, invoiceIds?: string[]): Promise<StoredSaleInvoice[]> {
-  const invoicesResult = invoiceIds && invoiceIds.length > 0
-    ? await database.query<InvoiceRow>(
-        `
-          select id, invoice_no, payment_status, payment_type, customer_id, customer_name, currency_code, exchange_rate, subtotal, vat_amount, total_amount, amount_paid_iqd, remaining_amount_iqd, notes, created_at
-            , employee_id, employee_name, shift_id, terminal_name
-          from app_sale_invoices
-          where id = any($1::text[])
-          order by created_at desc
-        `,
-        [invoiceIds],
-      )
-    : await database.query<InvoiceRow>(
-        `
-          select id, invoice_no, payment_status, payment_type, customer_id, customer_name, currency_code, exchange_rate, subtotal, vat_amount, total_amount, amount_paid_iqd, remaining_amount_iqd, notes, created_at, employee_id, employee_name, shift_id, terminal_name
-          from app_sale_invoices
-          order by created_at desc
-        `,
-      )
+async function loadInvoices(database: Queryable, invoiceIds?: string[], employeeId?: string): Promise<StoredSaleInvoice[]> {
+  let invoicesResult;
+  if (invoiceIds && invoiceIds.length > 0) {
+    invoicesResult = await database.query<InvoiceRow>(
+      `
+        select id, invoice_no, payment_status, payment_type, customer_id, customer_name, currency_code, exchange_rate, subtotal, vat_amount, total_amount, amount_paid_iqd, remaining_amount_iqd, notes, created_at
+          , employee_id, employee_name, shift_id, terminal_name
+        from app_sale_invoices
+        where id = any($1::text[])
+        order by created_at desc
+      `,
+      [invoiceIds],
+    );
+  } else if (employeeId) {
+    invoicesResult = await database.query<InvoiceRow>(
+      `
+        select id, invoice_no, payment_status, payment_type, customer_id, customer_name, currency_code, exchange_rate, subtotal, vat_amount, total_amount, amount_paid_iqd, remaining_amount_iqd, notes, created_at, employee_id, employee_name, shift_id, terminal_name
+        from app_sale_invoices
+        where employee_id = $1
+        order by created_at desc
+      `,
+      [employeeId],
+    );
+  } else {
+    invoicesResult = await database.query<InvoiceRow>(
+      `
+        select id, invoice_no, payment_status, payment_type, customer_id, customer_name, currency_code, exchange_rate, subtotal, vat_amount, total_amount, amount_paid_iqd, remaining_amount_iqd, notes, created_at, employee_id, employee_name, shift_id, terminal_name
+        from app_sale_invoices
+        order by created_at desc
+      `,
+    );
+  }
 
   if (invoicesResult.rows.length === 0) {
     return []
@@ -1638,7 +1651,7 @@ async function resolveFinalCashAllocations(client: PoolClient, amountIqd: number
   return allocations
 }
 
-async function createFinalCashOutflowEntry(client: PoolClient, input: Omit<FundMovementCreateInput, 'direction' | 'sourceFundAccountId'>) {
+async function createFinalCashOutflowEntry(client: PoolClient, input: Omit<FundMovementCreateInput, 'direction' | 'sourceFundAccountId'>, providedMovementNo?: string) {
   if (!Number.isFinite(input.amountIqd) || input.amountIqd <= 0) {
     throw new Error('مبلغ حركة الصندوق يجب أن يكون أكبر من صفر.')
   }
@@ -1660,7 +1673,7 @@ async function createFinalCashOutflowEntry(client: PoolClient, input: Omit<FundM
   }
 
   const movementId = createId('fund-movement')
-  const movementNo = await generateFundMovementNo(client)
+  const movementNo = providedMovementNo ?? await generateFundMovementNo(client)
 
   await client.query(
     `
@@ -1697,7 +1710,7 @@ async function createFinalCashOutflowEntry(client: PoolClient, input: Omit<FundM
   }
 }
 
-async function createCapitalTransactionEntry(client: PoolClient, input: CapitalTransactionCreateInput) {
+async function createCapitalTransactionEntry(client: PoolClient, input: CapitalTransactionCreateInput, providedMovementNo?: string) {
   const capitalFund = await getLockedFundAccountByCode(client, 'capital')
 
   if (!capitalFund || !capitalFund.is_active) {
@@ -1724,7 +1737,7 @@ async function createCapitalTransactionEntry(client: PoolClient, input: CapitalT
         notes: input.notes,
         createdByEmployeeId: input.createdByEmployeeId,
         createdByEmployeeName: input.createdByEmployeeName,
-      })
+      }, providedMovementNo)
     : await createFinalCashOutflowEntry(client, {
         movementDate: input.movementDate,
         amountIqd: input.amountIqd,
@@ -1734,7 +1747,7 @@ async function createCapitalTransactionEntry(client: PoolClient, input: CapitalT
         notes: input.notes,
         createdByEmployeeId: input.createdByEmployeeId,
         createdByEmployeeName: input.createdByEmployeeName,
-      })
+      }, providedMovementNo)
 
   const createdMovement = await loadFundMovementById(client, movement.id)
 
@@ -1745,7 +1758,7 @@ async function createCapitalTransactionEntry(client: PoolClient, input: CapitalT
   return createdMovement
 }
 
-async function createFundMovementEntry(client: PoolClient, input: FundMovementCreateInput) {
+async function createFundMovementEntry(client: PoolClient, input: FundMovementCreateInput, providedMovementNo?: string) {
   if (!Number.isFinite(input.amountIqd) || input.amountIqd <= 0) {
     throw new Error('مبلغ حركة الصندوق يجب أن يكون أكبر من صفر.')
   }
@@ -1797,7 +1810,8 @@ async function createFundMovementEntry(client: PoolClient, input: FundMovementCr
   }
 
   const movementId = createId('fund-movement')
-  const movementNo = await generateFundMovementNo(client)
+
+  const movementNo = providedMovementNo ?? await generateFundMovementNo(client)
 
   await client.query(
     `
@@ -1973,6 +1987,10 @@ function mapPostgresError(error: unknown, fallbackMessage: string) {
 
     if (detail.includes('(expense_no)')) {
       return new Error('تم توليد رقم مصروف مكرر. أعد المحاولة.')
+    }
+
+    if (detail.includes('app_fund_movements_movement_no_key') || detail.includes('(movement_no)')) {
+      return new Error('تعارض في رقم الحركة. أعد المحاولة.')
     }
   }
 
@@ -4585,8 +4603,8 @@ export function createPostgresDataAccess(pool: Pool): DataAccess {
       },
     },
     sales: {
-      async listInvoices() {
-        return loadInvoices(pool)
+      async listInvoices(employeeId?: string) {
+        return loadInvoices(pool, undefined, employeeId)
       },
       async createInvoice(input: CreateSaleInvoiceInput) {
         const client = await pool.connect()
@@ -4905,6 +4923,27 @@ export function createPostgresDataAccess(pool: Pool): DataAccess {
       async listAccounts() {
         return loadFundAccounts(pool)
       },
+      async listContributors() {
+        const result = await pool.query<{
+          counterparty_name: string | null
+          balance_iqd: string
+        }>(
+          `
+            select counterparty_name, sum(
+              case when reason = 'capital-contribution' then amount_iqd
+                   when reason = 'capital-repayment' then -amount_iqd
+                   else 0 end
+            ) as balance_iqd
+            from app_fund_movements
+            where counterparty_name is not null
+            group by counterparty_name
+            order by counterparty_name collate "und-x-icu"
+          `,
+          [],
+        )
+
+        return result.rows.map((r) => ({ contributorName: r.counterparty_name ?? '', balanceIqd: Number(r.balance_iqd) }))
+      },
       async listMovements() {
         return loadFundMovements(pool)
       },
@@ -4912,20 +4951,45 @@ export function createPostgresDataAccess(pool: Pool): DataAccess {
         return loadCapitalTransactions(pool)
       },
       async createCapitalTransaction(input: CapitalTransactionCreateInput) {
-        const client = await pool.connect()
+        const maxAttempts = 3
 
-        try {
-          await client.query('begin')
-          const movement = await createCapitalTransactionEntry(client, input)
+        for (let attempt = 0; attempt < maxAttempts; attempt++) {
+          // generate movement number outside the transaction to avoid aborted-transaction issues
+          const providedMovementNo = await generateFundMovementNoStandalone(pool)
 
-          await client.query('commit')
-          return movement
-        } catch (error) {
-          await client.query('rollback').catch(() => undefined)
-          throw mapPostgresError(error, 'تعذر تسجيل حركة رأس المال.')
-        } finally {
-          client.release()
+          const client = await pool.connect()
+
+          try {
+            await client.query('begin')
+            const movement = await createCapitalTransactionEntry(client, input, providedMovementNo)
+
+            await client.query('commit')
+            client.release()
+            return movement
+          } catch (error) {
+            try {
+              // eslint-disable-next-line no-console
+              console.error('[db] createCapitalTransaction failed (attempt %d)', attempt + 1, { input, error: error instanceof Error ? error.message : String(error), stack: error instanceof Error ? error.stack : undefined })
+            } catch (logErr) {
+              // ignore
+            }
+
+            await client.query('rollback').catch(() => undefined)
+            client.release()
+
+            const code = typeof error === 'object' && error !== null && 'code' in (error as any) ? String((error as any).code) : null
+            const constraint = typeof error === 'object' && error !== null && 'constraint' in (error as any) ? String((error as any).constraint) : null
+
+            if (code === '23505' && constraint === 'app_fund_movements_movement_no_key' && attempt + 1 < maxAttempts) {
+              // retry the whole transaction (movement_no collision)
+              continue
+            }
+
+            throw mapPostgresError(error, 'تعذر تسجيل حركة رأس المال.')
+          }
         }
+
+        throw new Error('تعذر تسجيل حركة رأس المال بعد عدة محاولات. أعد المحاولة.')
       },
       async updateCapitalTransaction(movementId: string, input: CapitalTransactionUpdateInput) {
         const client = await pool.connect()
@@ -5060,4 +5124,26 @@ export function createPostgresDataAccess(pool: Pool): DataAccess {
       await ensureDefaultAdminAccount(pool)
     },
   }
+}
+
+// Generate movement number in its own connection (outside caller transaction)
+async function generateFundMovementNoStandalone(pool: Pool) {
+  const today = new Date().toISOString().slice(0, 10)
+  const sequenceResult = await pool.query<{ value: number }>(
+    `
+      insert into app_daily_sequences (seq_key, seq_date, value)
+      values ('fund-movement', $1::date, 1)
+      on conflict (seq_key, seq_date)
+      do update set value = app_daily_sequences.value + 1
+      returning value
+    `,
+    [today],
+  )
+
+  const now = new Date()
+  const year = now.getFullYear()
+  const month = String(now.getMonth() + 1).padStart(2, '0')
+  const serial = String(sequenceResult.rows[0]?.value ?? 1).padStart(4, '0')
+
+  return `FUND-${year}${month}-${serial}`
 }
